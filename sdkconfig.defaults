@@ -1,0 +1,66 @@
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32696
+# Stack size for pthreads spawned WITHOUT an explicit size — and the only lever
+# that actually works for them. ESP-IDF's pthread_attr_init() seeds
+# attr->stacksize from this value, and pthread_create() then does
+# `if (attr) stack_size = attr->stacksize;` *unconditionally*, overriding
+# whatever esp_pthread_set_cfg()/ThreadSpawnConfiguration asked for. Rust's
+# thread::Builder always passes an attr, so a Builder with no .stack_size()
+# lands here no matter what the calling thread configured.
+#
+# That silently made jpeg-decoder's 3 per-component worker threads take 20000 B
+# each (60 KB of contiguous internal DRAM) on every map tile, which failed
+# outright once the app was fully up: "pthread: Failed to create task!" ->
+# decode aborted with ENOMEM. Those workers only do per-row IDCT/dequantization
+# with all their data on the heap, so they need very little. 8192 also matches
+# the stock 8 KB, and is still well above ESP-IDF's own 3072 default. Every
+# thread this app spawns itself sets .stack_size() directly and is unaffected.
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+CONFIG_LWIP_SNTP_MAX_SERVERS=4
+CONFIG_ESP32_SPIRAM_SUPPORT=y
+CONFIG_SOC_PSRAM_DMA_CAPABLE=y
+CONFIG_SPIRAM_SUPPORT=y
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_HTTPD_MAX_URI_LEN=1024
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_SPIRAM_USE=y
+CONFIG_SPIRAM_MEMTEST=n
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=32696
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=n
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+# Allocate small objects in internal RAM; larger in PSRAM (helps task stacks go to PSRAM)
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Reserve a bigger internal-RAM pool (default 32 KiB) that plain malloc() can't
+# touch, so it stays available for allocations that *must* be internal — above
+# all new task stacks. Ordinary mallocs filling internal RAM is exactly what
+# made every jpeg-decoder worker thread spawn fail ("pthread: Failed to create
+# task!" -> decode aborted with ENOMEM on every single map tile).
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
+# Push WiFi + lwIP buffers (a large internal-RAM consumer) to PSRAM first,
+# falling back to internal RAM only if PSRAM allocation fails. These are plain
+# data buffers, not task stacks, so this carries none of the PSRAM-stack
+# exception-handling risk that crashed the device when stacks were moved.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+#CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# mbedTLS has its own allocator (independent of malloc()'s PSRAM behavior
+# above) that defaults to internal DRAM only. Repeated HTTPS map-tile
+# fetches over a long-running session were fragmenting that shared internal
+# heap badly enough that mbedTLS's handshake-time allocations (a few KB for
+# RSA/ECC signature verification, AES contexts, ...) started failing outright
+# ("Dynamic Impl: alloc(...) failed", every live fetch failing thereafter for
+# the rest of the session) even though PSRAM was mostly idle. Moving mbedTLS
+# onto PSRAM removes it from that contention entirely.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# ─── RTC clock source ──────────────────────────────────────────────────────
+# External 32.768 kHz crystal on GPIO15/GPIO16 (XTAL_32K_P / XTAL_32K_N —
+# fixed pins on ESP32-S3, no further pin config needed). Far more accurate
+# than the default internal RC oscillator (~5-10% error), so system time
+# keeps drifting only slightly across soft resets / sleep when NTP is not
+# reachable. Falls back to the internal RC oscillator automatically if the
+# crystal fails to start.
+CONFIG_RTC_CLK_SRC_EXT_CRYS=y

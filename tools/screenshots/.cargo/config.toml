@@ -1,0 +1,6 @@
+# Override the firmware's xtensa target / build-std from the repo root config.
+[build]
+target = "x86_64-unknown-linux-gnu"
+
+[unstable]
+build-std = []

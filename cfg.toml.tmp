@@ -1,0 +1,44 @@
+[eew-display]
+wps_enable     = "true"     # "true": use WPS PBC on next boot when SSID is empty
+wifi_ssid      = ""         # your-ssid
+wifi_psk       = ""         # your-password
+ip_mode        = "dhcp"           # "dhcp" or "static"
+ip_address     = "192.168.0.200"
+subnet_mask    = "255.255.255.0"
+gateway        = "192.168.0.1"
+dns            = "1.1.1.1"
+
+syslog_server    = "192.168.0.140:514"
+syslog_enable    = "false"
+syslog_host_name = "esp32s3"
+syslog_app_name  = "eew-display"
+
+web_user     = "admin"
+web_password = "esp32"
+
+display_enable = "true"
+screen_timeout = "300"     # backlight off after this many idle seconds (0 = always on); a button or EEW / new quake wakes it
+
+ntp_server1 = "time.aws.com"
+ntp_server2 = "time.google.com"
+ntp_server3 = "time.cloudflare.com"
+ntp_server4 = "ntp.nict.jp"
+
+adc_conversion_factor = "437.98"
+
+# P2P地震情報 (p2pquake.net) feed: recent earthquakes + emergency earthquake warnings (EEW).
+# "true": enable. Default "false" — it keeps a TLS WebSocket open (~30 KB of internal RAM)
+# and needs WiFi plus a synced clock. Data: JMA via P2P地震情報.
+quake_enable         = "true"
+
+# MAX98357A I2S amplifier (DIN=IO7 BCLK=IO6 LRCLK=IO5 SD_MODE=IO4): spoken EEW / new-earthquake
+# announcements (needs tools/voice/voice.bin flashed to the `voice` partition) and the Web UI test tone.
+audio_enable         = "true"
+audio_volume         = "70"      # voice volume, percent (0-100)
+voice_eew            = "true"    # announce EEWs (chime + speech)
+voice_new            = "true"    # announce new earthquakes (chime + speech)
+
+# Google Maps Static API key — get one at https://console.cloud.google.com/ (enable "Maps Static API", see README).
+# This is only the default: the key can also be entered in the Web UI (Config > Map Settings), which overrides it.
+# Never commit a real key here; put it in your local, uncommitted cfg.toml, or leave it unset and use the Web UI.
+maps_api_key = ""

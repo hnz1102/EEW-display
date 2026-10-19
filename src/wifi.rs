@@ -1,0 +1,519 @@
+// Wi-Fi connection and RSSI measurement
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024 Hiroshi Nakajima
+
+#![allow(dead_code)]
+
+use std::time::Duration;
+use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use esp_idf_hal::peripheral;
+use esp_idf_svc::{eventloop::EspSystemEventLoop, handle::RawHandle, wifi::EspWifi};
+use esp_idf_sys;
+
+use embedded_svc::wifi::{ClientConfiguration, Configuration};
+use anyhow::bail;
+use anyhow::Result;
+use std::str::FromStr;
+use log::info;
+
+// ─── WPS state (shared between C event handler and Rust polling loop) ─────────
+
+/// Set to true when WPS credentials are ready.
+static WPS_SUCCESS: AtomicBool = AtomicBool::new(false);
+/// Set to true when WPS fails or times out.
+static WPS_FAILED: AtomicBool = AtomicBool::new(false);
+/// Set to true when credentials were captured from event_data (ap_cred_cnt > 0 path).
+static WPS_GOT_CREDS: AtomicBool = AtomicBool::new(false);
+
+/// Statically allocated buffers for SSID / passphrase captured in the WPS event handler.
+/// Written exactly once (under WPS_GOT_CREDS Release fence) before any reader sees the flag.
+static mut WPS_SSID_BUF: [u8; 33] = [0u8; 33];
+static mut WPS_PASS_BUF: [u8; 65] = [0u8; 65];
+
+/// Raw WPS event handler registered via esp_event_handler_register.
+///
+/// Two WPS-success paths in ESP-IDF:
+///   • ap_cred_cnt == 0 : driver connected internally, event_data may be NULL.
+///     Credentials end up in esp_wifi_get_config() — we read them in the poll loop.
+///   • ap_cred_cnt  > 0 : credentials are in event_data->ap_cred[].
+///     esp_wifi_get_config() may NOT contain the password yet at this point,
+///     so we copy them into WPS_SSID_BUF / WPS_PASS_BUF here.
+unsafe extern "C" fn wps_event_handler(
+    _arg: *mut core::ffi::c_void,
+    _base: esp_idf_sys::esp_event_base_t,
+    event_id: i32,
+    event_data: *mut core::ffi::c_void,
+) {
+    use esp_idf_sys::*;
+    let id = event_id as u32;
+    if id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_SUCCESS {
+        if !event_data.is_null() {
+            let evt = &*(event_data as *const wifi_event_sta_wps_er_success_t);
+            if evt.ap_cred_cnt > 0 {
+                let ssid  = &evt.ap_cred[0].ssid;
+                let pass  = &evt.ap_cred[0].passphrase;
+                let slen  = ssid.iter().position(|&b| b == 0).unwrap_or(ssid.len());
+                let plen  = pass.iter().position(|&b| b == 0).unwrap_or(pass.len());
+                // Use raw pointers to avoid shared references to mutable statics.
+                let dst_s = core::ptr::addr_of_mut!(WPS_SSID_BUF) as *mut u8;
+                core::ptr::copy_nonoverlapping(ssid.as_ptr(), dst_s, slen);
+                dst_s.add(slen).write(0u8);
+                let dst_p = core::ptr::addr_of_mut!(WPS_PASS_BUF) as *mut u8;
+                core::ptr::copy_nonoverlapping(pass.as_ptr(), dst_p, plen);
+                dst_p.add(plen).write(0u8);
+                // Release fence: readers see fully-written buffers after this store.
+                WPS_GOT_CREDS.store(true, Ordering::Release);
+            }
+        }
+        WPS_SUCCESS.store(true, Ordering::Release);
+    } else if id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_FAILED
+           || id == wifi_event_t_WIFI_EVENT_STA_WPS_ER_TIMEOUT {
+        WPS_FAILED.store(true, Ordering::Release);
+    }
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+pub fn wifi_connect(
+    modem: impl peripheral::Peripheral<P = esp_idf_hal::modem::Modem> + 'static,
+    ssid: &str,
+    pass: &str,
+) -> Result<Box<EspWifi<'static>>> {
+
+    if ssid.is_empty() || pass.is_empty() {
+        bail!("SSID or password is empty");
+    }
+    let sys_event_loop = EspSystemEventLoop::take().unwrap();
+    let mut wifi = Box::new(EspWifi::new(modem, sys_event_loop.clone(), None).unwrap());
+    register_net_events();
+
+    wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+        ssid: heapless::String::<32>::from_str(ssid).unwrap(),
+        password: heapless::String::<64>::from_str(pass).unwrap(),
+        ..Default::default()
+    })).unwrap();
+
+    wifi.start().unwrap();
+    wifi.connect()?;
+    let mut timeout = 0;
+    loop {
+        if wifi.is_connected().unwrap(){
+            // Disable power management to prevent beacon timeout issues
+            unsafe {
+                let ret = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+                if ret == esp_idf_sys::ESP_OK as i32 {
+                    info!("[WiFi] Power management disabled (WIFI_PS_NONE)");
+                } else {
+                    info!("[WiFi] Warning: Failed to disable WiFi PM: 0x{:x}", ret);
+                }
+            }
+            // info!("Wifi connected");
+            break;
+        }
+        thread::sleep(Duration::from_secs(1));
+        timeout += 1;
+        if timeout > 10 {
+            // info!("Wifi could not be connected.");
+            // wifi could not be connected, but we can use the wifi object to reconnect
+            break;
+        }
+    }
+    Ok(wifi)
+}
+
+pub fn configure_static_ip(
+    wifi: &EspWifi,
+    ip_addr: &str,
+    subnet_mask: &str,
+    gateway: &str,
+    dns: &str,
+) -> Result<()> {
+    use std::net::Ipv4Addr;
+
+    if ip_addr.is_empty() {
+        bail!("Static IP address is not configured");
+    }
+
+    let ip: Ipv4Addr = ip_addr.parse().map_err(|e| anyhow::anyhow!("Invalid IP address '{}': {}", ip_addr, e))?;
+    let mask: Ipv4Addr = subnet_mask.parse().map_err(|e| anyhow::anyhow!("Invalid subnet mask '{}': {}", subnet_mask, e))?;
+    let gw: Ipv4Addr = gateway.parse().map_err(|e| anyhow::anyhow!("Invalid gateway '{}': {}", gateway, e))?;
+
+    let netif = wifi.sta_netif();
+    let handle = netif.handle();
+
+    unsafe {
+        // Stop DHCP client before setting static IP
+        esp_idf_sys::esp_netif_dhcpc_stop(handle);
+
+        let ip_info = esp_idf_sys::esp_netif_ip_info_t {
+            ip: esp_idf_sys::esp_ip4_addr_t { addr: u32::from_ne_bytes(ip.octets()) },
+            netmask: esp_idf_sys::esp_ip4_addr_t { addr: u32::from_ne_bytes(mask.octets()) },
+            gw: esp_idf_sys::esp_ip4_addr_t { addr: u32::from_ne_bytes(gw.octets()) },
+        };
+
+        let ret = esp_idf_sys::esp_netif_set_ip_info(handle, &ip_info);
+        if ret != 0 {
+            bail!("esp_netif_set_ip_info failed: error code {}", ret);
+        }
+
+        // Set DNS server if provided
+        if !dns.is_empty() {
+            if let Ok(dns_ip) = dns.parse::<Ipv4Addr>() {
+                let mut dns_info: esp_idf_sys::esp_netif_dns_info_t = core::mem::zeroed();
+                dns_info.ip.u_addr.ip4.addr = u32::from_ne_bytes(dns_ip.octets());
+                esp_idf_sys::esp_netif_set_dns_info(
+                    handle,
+                    esp_idf_sys::esp_netif_dns_type_t_ESP_NETIF_DNS_MAIN,
+                    &mut dns_info,
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn get_rssi() -> i32 {
+    unsafe {
+        let mut rssi : i32 = 0;
+        esp_idf_sys::esp_wifi_sta_get_rssi(&mut rssi);
+        rssi
+    }
+}
+
+/// Returns true when the STA is associated with an AP.
+pub fn is_sta_connected() -> bool {
+    unsafe {
+        let mut ap: esp_idf_sys::wifi_ap_record_t = core::mem::zeroed();
+        esp_idf_sys::esp_wifi_sta_get_ap_info(&mut ap) == esp_idf_sys::ESP_OK as i32
+    }
+}
+
+// ─── Network state, kept up to date by events ────────────────────────────────
+//
+// Asking the WiFi driver (esp_wifi_sta_get_ap_info / _get_rssi) while it is not
+// connected makes it log "Haven't to connect to a suitable AP now!" on EVERY call.
+// The display and map threads used to ask every tick (~60 ms) during boot, which
+// flooded the log and kept poking the driver while it was trying to connect. So
+// they read this flag instead, which the system event loop keeps current.
+
+/// true while the station is associated and has an IP address.
+static NET_UP: AtomicBool = AtomicBool::new(false);
+
+/// true while the station is associated and has an IP address (no driver calls).
+pub fn net_up() -> bool { NET_UP.load(Ordering::Relaxed) }
+
+unsafe extern "C" fn net_event_handler(
+    _arg: *mut core::ffi::c_void,
+    base: esp_idf_sys::esp_event_base_t,
+    event_id: i32,
+    _event_data: *mut core::ffi::c_void,
+) {
+    use esp_idf_sys::*;
+    let id = event_id as u32;
+    if base == IP_EVENT {
+        if id == ip_event_t_IP_EVENT_STA_GOT_IP { NET_UP.store(true, Ordering::Relaxed); }
+        else if id == ip_event_t_IP_EVENT_STA_LOST_IP { NET_UP.store(false, Ordering::Relaxed); }
+    } else if base == WIFI_EVENT
+        && (id == wifi_event_t_WIFI_EVENT_STA_DISCONNECTED || id == wifi_event_t_WIFI_EVENT_STA_STOP)
+    {
+        NET_UP.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Start tracking the network state. Call once, before the WiFi driver is started.
+fn register_net_events() {
+    unsafe {
+        esp_idf_sys::esp_event_handler_register(
+            esp_idf_sys::WIFI_EVENT, esp_idf_sys::ESP_EVENT_ANY_ID,
+            Some(net_event_handler), core::ptr::null_mut());
+        esp_idf_sys::esp_event_handler_register(
+            esp_idf_sys::IP_EVENT, esp_idf_sys::ESP_EVENT_ANY_ID,
+            Some(net_event_handler), core::ptr::null_mut());
+    }
+}
+
+/// Re-derive the flag from the driver. Only call it when the station is known to
+/// be connected (e.g. after a static IP was applied, where no GOT_IP event may
+/// come): a call while disconnected makes the driver log a warning.
+pub fn refresh_net_state() {
+    NET_UP.store(is_sta_connected() && has_ip(), Ordering::Relaxed);
+}
+
+/// True once the station has an IPv4 address (DHCP done or static IP set), i.e.
+/// when DNS and TLS connections can actually work. Association alone is not enough.
+pub fn has_ip() -> bool {
+    unsafe {
+        let h = esp_idf_sys::esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
+        if h.is_null() { return false; }
+        let mut info: esp_idf_sys::esp_netif_ip_info_t = core::mem::zeroed();
+        esp_idf_sys::esp_netif_get_ip_info(h, &mut info) == esp_idf_sys::ESP_OK as i32 && info.ip.addr != 0
+    }
+}
+
+/// Spawn a background thread that calls `esp_wifi_connect()` whenever the
+/// station is not associated with an AP.  The thread starts after an initial
+/// `start_delay_secs` grace period (let the first connection attempt settle),
+/// then checks every `interval_secs` seconds.
+///
+/// No reference to `EspWifi` is required — the credentials were already
+/// committed to the driver by `wifi_connect()`.
+pub fn start_wifi_monitor_thread(start_delay_secs: u64, interval_secs: u64) {
+    thread::Builder::new()
+        .name("wifi_mon".into())
+        .stack_size(4096)
+        .spawn(move || {
+            thread::sleep(Duration::from_secs(start_delay_secs));
+            let mut fails = 0u32;
+            loop {
+                if is_sta_connected() {
+                    fails = 0;
+                    // Reconcile the event-driven flag (e.g. static IP: no GOT_IP event).
+                    if has_ip() { NET_UP.store(true, Ordering::Relaxed); }
+                } else {
+                    NET_UP.store(false, Ordering::Relaxed);
+                    fails += 1;
+                    info!("[WiFi] Monitor: not connected (attempt {}) — calling esp_wifi_connect()", fails);
+                    unsafe {
+                        // Cancel any stale connection attempt first
+                        esp_idf_sys::esp_wifi_disconnect();
+                    }
+                    // Still nothing after a few tries (e.g. the router was still
+                    // booting and the driver's scan / retry state got stuck): restart
+                    // the WiFi driver itself, not just the connection attempt.
+                    if fails >= 3 && fails % 3 == 0 {
+                        info!("[WiFi] Monitor: restarting the WiFi driver");
+                        unsafe {
+                            esp_idf_sys::esp_wifi_stop();
+                            thread::sleep(Duration::from_millis(500));
+                            esp_idf_sys::esp_wifi_start();
+                        }
+                        thread::sleep(Duration::from_millis(300));
+                    }
+                    thread::sleep(Duration::from_millis(300));
+                    unsafe {
+                        let rc = esp_idf_sys::esp_wifi_connect();
+                        if rc != esp_idf_sys::ESP_OK as i32 {
+                            info!("[WiFi] Monitor: esp_wifi_connect() returned 0x{:x}", rc);
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_secs(interval_secs));
+            }
+        })
+        .expect("spawn wifi_mon");
+}
+
+/// Connect to Wi-Fi using WPS PBC (Push Button Configuration).
+///
+/// Returns the connected `EspWifi` plus the SSID and passphrase obtained from
+/// the AP so the caller can persist them to NVS.
+///
+/// The user must press the WPS button on the router within 120 seconds.
+pub fn wifi_connect_wps(
+    modem: impl peripheral::Peripheral<P = esp_idf_hal::modem::Modem> + 'static,
+) -> Result<(Box<EspWifi<'static>>, String, String)> {
+    info!("[WPS] Starting WPS PBC — press the WPS button on your router within 120 s");
+
+    // Display WPS mode message
+    crate::display::show_system_message(
+        "WPS MODE",
+        "Press WPS button\non your router\nwithin 120 seconds"
+    );
+
+    let sys_event_loop = EspSystemEventLoop::take().unwrap();
+    let mut wifi = Box::new(EspWifi::new(modem, sys_event_loop, None).unwrap());
+    register_net_events();
+
+    // STA mode with empty credentials
+    wifi.set_configuration(&Configuration::Client(ClientConfiguration::default())).unwrap();
+    wifi.start().unwrap();
+
+    // Reset static WPS state
+    WPS_SUCCESS.store(false, Ordering::Release);
+    WPS_FAILED.store(false, Ordering::Release);
+    WPS_GOT_CREDS.store(false, Ordering::Release);
+
+    unsafe {
+        // Register WPS event handler on the default system event loop
+        esp_idf_sys::esp_event_handler_register(
+            esp_idf_sys::WIFI_EVENT,
+            esp_idf_sys::ESP_EVENT_ANY_ID,
+            Some(wps_event_handler),
+            core::ptr::null_mut(),
+        );
+
+        // Enable WPS PBC and start the handshake
+        let cfg = esp_idf_sys::esp_wps_config_t {
+            wps_type: esp_idf_sys::wps_type_WPS_TYPE_PBC,
+            ..Default::default()
+        };
+        let ret = esp_idf_sys::esp_wifi_wps_enable(&cfg);
+        if ret != esp_idf_sys::ESP_OK as i32 {
+            // Unregister event handler before returning
+            esp_idf_sys::esp_event_handler_unregister(
+                esp_idf_sys::WIFI_EVENT,
+                esp_idf_sys::ESP_EVENT_ANY_ID,
+                Some(wps_event_handler),
+            );
+            bail!("[WPS] esp_wifi_wps_enable failed: 0x{:x}", ret);
+        }
+        let ret = esp_idf_sys::esp_wifi_wps_start(0);
+        if ret != esp_idf_sys::ESP_OK as i32 {
+            esp_idf_sys::esp_wifi_wps_disable();
+            // Unregister event handler before returning
+            esp_idf_sys::esp_event_handler_unregister(
+                esp_idf_sys::WIFI_EVENT,
+                esp_idf_sys::ESP_EVENT_ANY_ID,
+                Some(wps_event_handler),
+            );
+            bail!("[WPS] esp_wifi_wps_start failed: 0x{:x}", ret);
+        }
+    }
+
+    // Poll for WPS result (up to 120 s)
+    for elapsed in 0..120u32 {
+        thread::sleep(Duration::from_secs(1));
+
+        // Update countdown every 10 seconds
+        if elapsed % 10 == 0 && elapsed > 0 {
+            let remaining = 120 - elapsed;
+            crate::display::show_system_message(
+                "WPS MODE",
+                &format!("Press WPS button\non your router\n{} seconds remaining", remaining)
+            );
+        }
+
+        if WPS_FAILED.load(Ordering::Acquire) {
+            unsafe {
+                esp_idf_sys::esp_wifi_wps_disable();
+                // Unregister event handler
+                esp_idf_sys::esp_event_handler_unregister(
+                    esp_idf_sys::WIFI_EVENT,
+                    esp_idf_sys::ESP_EVENT_ANY_ID,
+                    Some(wps_event_handler),
+                );
+            }
+            crate::display::clear_system_message();
+            bail!("[WPS] WPS failed or timed out by AP at {}s", elapsed);
+        }
+
+        if WPS_SUCCESS.load(Ordering::Acquire) {
+            // Read credentials:
+            //   • ap_cred_cnt > 0 path: captured from event_data in wps_event_handler.
+            //   • ap_cred_cnt == 0 path: driver connected internally; read from esp_wifi_get_config().
+            let (ssid, pass) = if WPS_GOT_CREDS.load(Ordering::Acquire) {
+                unsafe {
+                    // Copy into local buffers via raw pointers; no reference to static mut.
+                    let mut ssid_local = [0u8; 33];
+                    let mut pass_local = [0u8; 65];
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::addr_of!(WPS_SSID_BUF) as *const u8,
+                        ssid_local.as_mut_ptr(), 33,
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        core::ptr::addr_of!(WPS_PASS_BUF) as *const u8,
+                        pass_local.as_mut_ptr(), 65,
+                    );
+                    let slen = ssid_local.iter().position(|&b| b == 0).unwrap_or(33);
+                    let plen = pass_local.iter().position(|&b| b == 0).unwrap_or(65);
+                    (
+                        String::from_utf8_lossy(&ssid_local[..slen]).into_owned(),
+                        String::from_utf8_lossy(&pass_local[..plen]).into_owned(),
+                    )
+                }
+            } else {
+                // ap_cred_cnt == 0: credentials were stored by the driver; read from config.
+                unsafe {
+                    let mut cfg: esp_idf_sys::wifi_config_t = core::mem::zeroed();
+                    esp_idf_sys::esp_wifi_get_config(
+                        esp_idf_sys::wifi_interface_t_WIFI_IF_STA,
+                        &mut cfg,
+                    );
+                    let sta = &cfg.sta;
+                    let ssid_raw = &sta.ssid;
+                    let pass_raw = &sta.password;
+                    let ssid_len = ssid_raw.iter().position(|&b| b == 0).unwrap_or(ssid_raw.len());
+                    let pass_len = pass_raw.iter().position(|&b| b == 0).unwrap_or(pass_raw.len());
+                    (
+                        String::from_utf8_lossy(&ssid_raw[..ssid_len]).into_owned(),
+                        String::from_utf8_lossy(&pass_raw[..pass_len]).into_owned(),
+                    )
+                }
+            };
+            unsafe {
+                esp_idf_sys::esp_wifi_wps_disable();
+                // Unregister event handler
+                esp_idf_sys::esp_event_handler_unregister(
+                    esp_idf_sys::WIFI_EVENT,
+                    esp_idf_sys::ESP_EVENT_ANY_ID,
+                    Some(wps_event_handler),
+                );
+            }
+            info!("[WPS] Credentials received: SSID={}", ssid);
+
+            // Show connecting message
+            crate::display::show_system_message(
+                "WPS SUCCESS",
+                &format!("Connecting to\n{}\nPlease wait...", ssid)
+            );
+
+            // Connect with the obtained credentials
+            wifi.set_configuration(&Configuration::Client(ClientConfiguration {
+                ssid: heapless::String::<32>::from_str(&ssid)
+                    .map_err(|_| anyhow::anyhow!("WPS SSID too long"))?,
+                password: heapless::String::<64>::from_str(&pass)
+                    .map_err(|_| anyhow::anyhow!("WPS passphrase too long"))?,
+                ..Default::default()
+            })).unwrap();
+            wifi.connect()?;
+
+            let mut t = 0;
+            loop {
+                if wifi.is_connected().unwrap() {
+                    crate::display::show_system_message(
+                        "CONNECTED",
+                        &format!("{}\nConnection successful!", ssid)
+                    );
+                    
+                    // Wait for WPS internal processing to complete before changing power settings
+                    info!("[WPS] Waiting for connection stabilization...");
+                    thread::sleep(Duration::from_secs(3));
+                    
+                    // Disable power management to prevent beacon timeout issues after WPS
+                    unsafe {
+                        let ret = esp_idf_sys::esp_wifi_set_ps(esp_idf_sys::wifi_ps_type_t_WIFI_PS_NONE);
+                        if ret == esp_idf_sys::ESP_OK as i32 {
+                            info!("[WPS] WiFi power management disabled (WIFI_PS_NONE)");
+                        } else {
+                            info!("[WPS] Warning: Failed to disable WiFi PM: 0x{:x}", ret);
+                        }
+                    }
+                    
+                    // Clear system message to return to normal display
+                    crate::display::clear_system_message();
+                    break;
+                }
+                thread::sleep(Duration::from_secs(1));
+                t += 1;
+                if t >= 15 { break; }
+            }
+
+            return Ok((wifi, ssid, pass));
+        }
+    }
+
+    unsafe {
+        esp_idf_sys::esp_wifi_wps_disable();
+        // Unregister event handler on timeout
+        esp_idf_sys::esp_event_handler_unregister(
+            esp_idf_sys::WIFI_EVENT,
+            esp_idf_sys::ESP_EVENT_ANY_ID,
+            Some(wps_event_handler),
+        );
+    }
+    crate::display::clear_system_message();
+    bail!("[WPS] WPS timed out after 120 s");
+}

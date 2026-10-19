@@ -1,0 +1,16 @@
+[package]
+name = "screenshots"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Host-only tool: renders each TFT page to a PNG. Deliberately not part of the
+# firmware crate (different target/toolchain) -- see ../../.cargo/config.toml.
+
+[dependencies]
+embedded-graphics = "0.8.1"
+png = "0.17"
+log = "0.4"
+jpeg-decoder = { version = "0.3", default-features = false }
+
+[workspace]

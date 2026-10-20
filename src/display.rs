@@ -324,6 +324,7 @@ fn display_task(
     let mut last_eew_ver = crate::quake::eew_version();
     let mut last_newq_ver = crate::quake::newq_version();
     let mut batt_level: u8 = BATT_NONE;
+    let mut last_net: (u8, u8) = (255, 255);
     let mut last_activity = Instant::now();
     let mut screen_off = false;
 
@@ -410,6 +411,14 @@ fn display_task(
             draw_battery_icon(&mut display, new_level, page == PAGE_MAP);
         }
         batt_level = new_level;
+
+        // ── Wi-Fi / WebSocket icons (every page, left of the battery) ──
+        // Redrawn when the page was repainted or when either state changed.
+        let net = net_status();
+        if sys_msg.is_none() && (force_full_redraw || map_redrawn || net != last_net) {
+            draw_status_icons(&mut display, net.0, net.1, page == PAGE_MAP);
+        }
+        last_net = net;
 
         // While the backlight is off nothing is sent (the changes pile up in the
         // dirty rectangle and go out in one piece when the screen wakes).

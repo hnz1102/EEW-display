@@ -77,7 +77,7 @@ The unit starts on the MAP page; a short press of BOOT cycles the pages.
 | # | Page | Content |
 |---|------|---------|
 | 1 | EARTHQUAKE | Recent earthquakes (list + details of the highlighted one) |
-| 2 | MAP | Full-screen Google map (480×266) between a one-line top bar (title, button legend, battery) and a two-column text band: the Japan overview, the quake picked in the list, or the EEW epicenter, with epicenters, scale bar and — for a selected / new / EEW quake — magnitude, intensity, depth, coordinates, nearest place and time |
+| 2 | MAP | Full-screen Google map (480×266) between a one-line top bar (title, button legend, status icons, battery) and a two-column text band: the Japan overview, the quake picked in the list, or the EEW epicenter, with epicenters, scale bar and — for a selected / new / EEW quake — magnitude, intensity, depth, coordinates, nearest place and time |
 | 3 | SYSTEM INFO | Network, power, memory, earthquake feed state, display and firmware version |
 
 ### Buttons
@@ -93,6 +93,16 @@ The unit starts on the MAP page; a short press of BOOT cycles the pages.
 While an EEW or a newly received earthquake is shown, BOOT (EXIT) returns to
 the normal view.  Buttons auto-repeat after 400 ms.  When the screen is off
 (see below) the first press only wakes it — its action is not performed.
+
+### Status icons
+
+On every page, left of the battery in the title bar: a **Wi-Fi** icon — four
+signal bars (green = strong, yellow = fair, orange = weak; dim with a red slash =
+not connected / no IP address) — and a **WebSocket** icon, a chain link: green =
+connected to the earthquake feed, orange with a red slash = down and
+reconnecting, grey = the feed is switched off (`quake_enable`).  The chain is a
+16×16 bitmap kept as a constant in `src/display_pages.rs` (flash, no RAM), drawn
+pixel by pixel in the state colour.
 
 ### Screen saver
 
@@ -138,7 +148,7 @@ and a synced clock (NTP), because the connection is TLS.
 The TFT font is ASCII only, so Japanese epicenter and area names appear in the
 Web UI only; the TFT shows the coordinates and, on the MAP page, the nearest
 well-known place with distance and direction (e.g. `45km ESE of Iwaki`, from a
-built-in table of ~100 cities and islands in [`src/place.rs`](src/place.rs), so it
+built-in table of ~75 cities and islands in [`src/place.rs`](src/place.rs), so it
 works offline and for epicenters at sea).  The unit has no position sensor, so
 it does not compute the distance to the epicenter.
 
@@ -308,8 +318,9 @@ eew-display/
 │   └── boot_log.rs       # NVS boot counter and rolling reset-reason log (last 10 entries)
 ├── tools/
 │   ├── voice/            # PC tool: generates voice.bin (Google Cloud TTS) — see Spoken announcements
-│   └── screenshots/      # Host tool: renders every TFT page to PNG (see below)
-├── docs/images/          # README images; tft/ holds the generated TFT screenshots
+│   ├── screenshots/      # Host tool: renders every TFT page to PNG (see below)
+│   └── webui_screenshots/ # Host tool: screenshots of the Web UI pages (see Web UI)
+├── docs/images/          # README images; tft/ = TFT screenshots, webui/ = Web UI screenshots
 ├── hw/                   # KiCad schematic/PCB of the earlier GNSS board
 ├── STL/                  # Enclosure of the earlier GNSS board
 ├── cfg.toml              # Build-time default configuration (gitignored — contains credentials)
@@ -672,6 +683,79 @@ The key is taken from the `GOOGLE_MAPS_API_KEY` environment variable, else
 (gitignored).  Without a key — or with `SCREENSHOTS_OFFLINE=1` — a schematic map
 is drawn instead.  The firmware version on the SYSTEM INFO sample is read from
 `Cargo.toml`.
+
+---
+
+## Web UI
+
+Once the device is on Wi-Fi it serves a Web UI at `http://<device_ip>/` (port 80).
+Sign in with `web_user` / `web_password` (default `admin` / `esp32` — change
+them).  The screenshots below were rendered from the firmware's own page HTML
+against a mock of the device API with **synthetic sample data** (made-up
+earthquakes and network); see [Regenerating the Web UI screenshots](#regenerating-the-web-ui-screenshots).
+
+### Sign in
+
+<p align="center"><img src="docs/images/webui/01-login.png" width="480" alt="Login page"></p>
+
+### Configuration page
+
+The page has a card per topic.  *Save to NVS* stores the settings (most apply
+immediately; *Reboot* applies the rest), *Reset Defaults* erases NVS and returns to
+the `cfg.toml` values, and *Boot Log* shows the reset reasons of the last boots.
+
+<p align="center"><img src="docs/images/webui/02-config.png" width="560" alt="Configuration page"></p>
+
+| Card | What it does |
+|------|--------------|
+| **Device Status** | Firmware version and build date, IP address, SSID, signal strength, battery voltage, chip temperature, free internal RAM and PSRAM (refreshed every 3 s) |
+| **Recent Earthquakes** | The latest events with the epicenter name in Japanese (a link to the Web UI map centred on it), magnitude, intensity, depth and tsunami status; a red banner while an EEW is active |
+| **Audio** | Test tone on/off with a 100 Hz – 15 kHz slider, **Volume** slider, **Announce** switches for EEW / new earthquake, and *Test EEW voice* / *Test new-quake voice* buttons (shown when `audio_enable = "true"`) |
+| **WiFi / Network** | SSID and password, WPS enable, DHCP or static IP |
+| **Syslog** | Optional remote logging (server, host name, app name) |
+| **Authentication** | The Web UI user name and password |
+| **Display** | Screen-saver timeout (backlight off after N idle seconds) |
+| **NTP Servers** | Up to four time servers |
+| **Map Settings** | Map type (satellite / roadmap) and the Google Maps API key |
+
+While an EEW is active the *Recent Earthquakes* card shows the warning at the top,
+with a link that opens the map framed on the forecast epicenter:
+
+<p align="center"><img src="docs/images/webui/03-config-eew.png" width="560" alt="Configuration page with an EEW banner"></p>
+
+### Map page
+
+`/map` shows the recent epicenters on a Google map, drawn in the browser: circles
+sized by magnitude and coloured by maximum intensity, labelled like `M5.4 I5弱`.
+−/+ change the zoom and the satellite / road button switches the map type (both
+act on the device's own map too).  `/map?lat=…&lon=…&zoom=…` views an arbitrary
+point — the earthquake list links to it — and *Overview* returns to the Japan
+view.
+
+| Overview | Epicenter view | During an EEW |
+|---|---|---|
+| ![Overview](docs/images/webui/04-map-overview.png) | ![Epicenter](docs/images/webui/05-map-epicenter.png) | ![EEW](docs/images/webui/06-map-eew.png) |
+
+The map page downloads its images directly from Google using the Maps API key the
+device hands to a signed-in browser (see [Google Maps API key](#google-maps-api-key)).
+
+### Regenerating the Web UI screenshots
+
+[`tools/webui_screenshots/capture.py`](tools/webui_screenshots/capture.py) pulls the
+login, configuration and map pages out of `src/httpserver.rs`, fills the
+configuration template with sample settings, serves them from a small local mock of
+the device API, and photographs them with headless Firefox:
+
+```bash
+python3 tools/webui_screenshots/capture.py      # writes docs/images/webui/
+```
+
+It needs Firefox and Pillow.  Each distinct map view is fetched **once** from
+Google with the key from `GOOGLE_MAPS_API_KEY` (else `maps_api_key` in `cfg.toml`)
+and cached in `tools/webui_screenshots/.tile-cache/` (gitignored), so re-running
+costs no API calls; without a key a grey placeholder is used.  The key never
+appears in the pictures.  (A snap-packaged Firefox can only write below your home
+directory, so keep the output folder there.)
 
 ---
 

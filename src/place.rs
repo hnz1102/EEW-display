@@ -1,7 +1,7 @@
 //! Offline "where is this epicenter" text for the TFT, whose font is ASCII only
 //! (so JMA's Japanese hypocenter names can't be drawn) and for epicenters that
 //! are mostly out at sea (so a reverse geocoder has nothing to return): the
-//! nearest of ~100 well-known places, with distance and compass direction,
+//! nearest of ~75 well-known places, with distance and compass direction,
 //! e.g. "45km ESE of Iwaki". No ESP-IDF dependency (the screenshot tool uses it).
 
 /// (name, lat, lon): prefecture capitals, main coastal cities and outlying islands.

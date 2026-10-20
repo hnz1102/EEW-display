@@ -15,6 +15,7 @@ mod place;
 mod httpserver;
 mod map_display;
 mod quake;
+mod wifi;
 
 use std::convert::Infallible;
 use std::fs::File;
@@ -129,6 +130,8 @@ fn render(page: u8, batt: u8, body: impl FnOnce(&mut Fb)) -> Fb {
     if page != PAGE_MAP { draw_header(&mut fb, page, &header_style()); }
     body(&mut fb);
     draw_battery_icon(&mut fb, batt, page == PAGE_MAP);
+    let (w, s) = net_status();
+    draw_status_icons(&mut fb, w, s, page == PAGE_MAP);
     fb
 }
 

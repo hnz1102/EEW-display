@@ -64,7 +64,9 @@ pub fn eew_version() -> u32 { 0 }
 
 pub const QUAKE_MAX: usize = 20;
 
-pub fn ws_connected() -> bool { true }
+static WS_UP: AtomicBool = AtomicBool::new(true);
+pub fn ws_connected() -> bool { WS_UP.load(Ordering::Relaxed) }
+pub fn set_ws_connected(on: bool) { WS_UP.store(on, Ordering::Relaxed); }
 
 pub fn eew_view(e: &Eew) -> (f64, f64, u8) { fit_view(e.lat, e.lon, e.mag) }
 

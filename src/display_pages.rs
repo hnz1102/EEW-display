@@ -183,6 +183,91 @@ pub(crate) fn draw_battery_icon<D: DrawTarget<Color = Rgb565>>(display: &mut D, 
     }
 }
 
+// ─── Wi-Fi / WebSocket status icons (top-right of every page, left of the battery) ───
+
+/// Current link state for the status icons: (Wi-Fi, WebSocket).
+/// Wi-Fi: 0 = no connection / IP, 1..=4 = signal bars. WebSocket: 0 = the quake
+/// feed is switched off, 1 = down (reconnecting), 2 = connected.
+pub(crate) fn net_status() -> (u8, u8) {
+    let wifi = if !crate::wifi::net_up() {
+        0
+    } else {
+        let rssi = DISPLAY_AUX.lock().unwrap().as_ref()
+            .map(|aux| *aux.status.rssi.lock().unwrap())
+            .unwrap_or(0);
+        match rssi { r if r >= -55 => 4, r if r >= -67 => 3, r if r >= -75 => 2, _ => 1 }
+    };
+    let ws = if !crate::quake::enabled() { 0 } else if crate::quake::ws_connected() { 2 } else { 1 };
+    (wifi, ws)
+}
+
+/// Horizontal room the icons take, ending before the battery (which clears from
+/// SCREEN_W - 36).
+const STATUS_X: i32 = SCREEN_W - 36 - 44;
+const STATUS_W: i32 = 44;
+
+/// A chain link (two interlocked capsules on the diagonal), 16 × 16, '#' = set.
+/// Compiled into flash as a constant: no RAM, nothing to load.
+const LINK_ICON: [&str; 16] = [
+    "..........#####.",
+    ".........#######",
+    "........###...##",
+    ".......###....##",
+    "......###.....##",
+    ".....####....###",
+    "....######..###.",
+    "...####.######..",
+    "..######.####...",
+    ".###..######....",
+    "###....####.....",
+    "##.....###......",
+    "##....###.......",
+    "##...###........",
+    "#######.........",
+    ".#####..........",
+];
+
+/// Draw a '#'-mask at (x, y) in one colour.
+fn draw_mask<D: DrawTarget<Color = Rgb565>>(display: &mut D, x: i32, y: i32, mask: &[&str], color: Rgb565) {
+    let _ = display.draw_iter(mask.iter().enumerate().flat_map(|(row, line)| {
+        line.bytes().enumerate().filter(|&(_, b)| b == b'#')
+            .map(move |(col, _)| Pixel(Point::new(x + col as i32, y + row as i32), color))
+    }));
+}
+
+/// Draw the Wi-Fi (signal bars) and WebSocket (chain link) icons.
+/// `compact`: the MAP page's one-line top bar (MAP_BAR_H high) instead of the
+/// normal HEADER_H-high header. Wi-Fi: green/yellow/orange bars by strength, all
+/// dim with a red slash when there is no connection. WebSocket: green link when
+/// connected, orange with a red slash while down and reconnecting, dim grey when
+/// the feed is off.
+pub(crate) fn draw_status_icons<D: DrawTarget<Color = Rgb565>>(display: &mut D, wifi: u8, ws: u8, compact: bool) {
+    let (bar_h, dy) = if compact { (MAP_BAR_H, 0) } else { (HEADER_H, 4) };
+    fill(display, STATUS_X, 0, STATUS_W, bar_h, Rgb565::BLACK);
+
+    // Wi-Fi: four bars, 3 px wide, rising 3 px each, bottoms at y = 16 (+dy)
+    let wx = STATUS_X + 2;
+    let lit = match wifi { 4 | 3 => Rgb565::CSS_LIGHT_GREEN, 2 => Rgb565::YELLOW, _ => Rgb565::CSS_ORANGE };
+    for i in 0..4i32 {
+        let h = 4 + i * 3;
+        let on = wifi > 0 && i < wifi as i32;
+        fill(display, wx + i * 4, 16 + dy - h, 3, h, if on { lit } else { Rgb565::new(5, 10, 5) });
+    }
+    let red = PrimitiveStyle::with_stroke(Rgb565::RED, 2);
+    if wifi == 0 {
+        let _ = Line::new(Point::new(wx, 3 + dy), Point::new(wx + 14, 17 + dy)).into_styled(red).draw(display);
+    }
+
+    // WebSocket: the chain link
+    let lx = STATUS_X + 24;
+    let ly = 2 + dy;
+    let col = match ws { 2 => Rgb565::CSS_LIGHT_GREEN, 1 => Rgb565::CSS_ORANGE, _ => Rgb565::new(10, 20, 10) };
+    draw_mask(display, lx, ly, &LINK_ICON, col);
+    if ws == 1 {
+        let _ = Line::new(Point::new(lx + 1, ly + 1), Point::new(lx + 15, ly + 15)).into_styled(red).draw(display);
+    }
+}
+
 // ─── System message overlay drawing ──────────────────────────────────────
 
 pub(crate) fn draw_system_message<D: DrawTarget<Color = Rgb565>>(

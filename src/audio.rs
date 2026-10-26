@@ -46,6 +46,10 @@ static FREQ_HZ: AtomicU32 = AtomicU32::new(1_000);
 static VOLUME: AtomicU32 = AtomicU32::new(70);
 
 /// True once the audio thread has started the I2S output.
+/// True while a sentence is being played.
+static PLAYING: AtomicBool = AtomicBool::new(false);
+pub fn playing() -> bool { PLAYING.load(Ordering::Relaxed) }
+
 pub fn running() -> bool { RUNNING.load(Ordering::Relaxed) }
 /// Current tone frequency in Hz.
 pub fn freq_hz() -> u32 { FREQ_HZ.load(Ordering::Relaxed) }
@@ -441,6 +445,13 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
     let mut player: Option<Player> = None;
     let mut prev: i32 = 0; // last voice sample (for the ×3 interpolation)
     let mut amp_on = false;
+    // Glitch diagnostics: longest gap between two buffer submissions while a
+    // sentence plays, and the longest time spent synthesising one buffer.
+    // One chunk is 10 ms and the DMA ring holds 60 ms, so a gap above ~60 ms
+    // is an audible dropout. Logged once per sentence (never inside the loop).
+    let mut last_wr = std::time::Instant::now();
+    let (mut max_gap, mut max_gen, mut gap_at, mut gap_t) = (0u128, 0u128, 0u32, 0i64);
+    let mut chunks = 0u32;
     loop {
         // New sentence? An EEW sentence is never cut off by a non-EEW one.
         while let Ok(pb) = rx.try_recv() {
@@ -459,6 +470,8 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
             amp_on = want_amp;
         }
 
+        PLAYING.store(player.is_some(), Ordering::Relaxed);
+        let gen_t = std::time::Instant::now();
         if let Some(p) = player.as_mut() {
             let vol = VOLUME.load(Ordering::Relaxed) as i32;
             let mut done = false;
@@ -476,7 +489,12 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
                 }
                 prev = cur;
             }
-            if done { player = None; prev = 0; }
+            if done {
+                player = None; prev = 0;
+                info!("[AUDIO] sentence done: {} chunks, max write gap {} ms (at chunk {}, ended at uptime {} ms), max synth {} ms",
+                      chunks, max_gap, gap_at, gap_t, max_gen);
+                max_gap = 0; max_gen = 0; chunks = 0;
+            }
         } else {
             let step = (((FREQ_HZ.load(Ordering::Relaxed) as u64) << 32) / SAMPLE_RATE_HZ as u64) as u32;
             for n in 0..FRAMES {
@@ -486,6 +504,14 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
                 buf[n * 4] = b[0]; buf[n * 4 + 1] = b[1]; buf[n * 4 + 2] = b[0]; buf[n * 4 + 3] = b[1];
             }
         }
+        let gen_ms = gen_t.elapsed().as_millis();
         tx.write_all(&buf, BLOCK)?;
+        if player.is_some() {
+            let gap = last_wr.elapsed().as_millis();
+            if gap > max_gap { max_gap = gap; gap_at = chunks; gap_t = unsafe { esp_idf_sys::esp_timer_get_time() } / 1000; }
+            if gen_ms > max_gen { max_gen = gen_ms; }
+            chunks += 1;
+        }
+        last_wr = std::time::Instant::now();
     }
 }

@@ -684,6 +684,8 @@ pub fn start() {
                         WS_ALIVE.store(false, Ordering::Relaxed);
                     }
                     if ws.is_none() && now.saturating_sub(ws_since) >= 30 && !crate::map_display::is_busy()
+                        // Creating the client stalled the audio thread ~820 ms (audible dropout): wait for the sentence to end.
+                        && !crate::audio::playing()
                         && (now as u32).saturating_sub(LAST_MAP_FETCH_SECS.load(Ordering::Relaxed)) >= WS_RESUME_AFTER_MAP_SECS {
                         ws_since = now;
                         if internal_free() >= WS_MIN_INTERNAL_FREE {

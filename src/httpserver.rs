@@ -39,6 +39,9 @@ pub struct NvsConfig {
     pub audio_volume: String,
     pub voice_eew: String,
     pub voice_new: String,
+    pub quiet_enable: String,
+    pub quiet_start: String,
+    pub quiet_end: String,
     pub wps_enable:    String,
     pub ntp_server1:   String,
     pub ntp_server2:   String,
@@ -108,6 +111,9 @@ fn nvs_write_all(cfg: &NvsConfig) -> bool {
             ("audio_volume", &cfg.audio_volume),
             ("voice_eew", &cfg.voice_eew),
             ("voice_new", &cfg.voice_new),
+            ("quiet_enable", &cfg.quiet_enable),
+            ("quiet_start", &cfg.quiet_start),
+            ("quiet_end", &cfg.quiet_end),
             ("wps_enable",    &cfg.wps_enable),
             ("ntp_server1",   &cfg.ntp_server1),
             ("ntp_server2",   &cfg.ntp_server2),
@@ -219,6 +225,9 @@ pub fn load_config(defaults: NvsConfig) -> NvsConfig {
         audio_volume: or(nvs_read("audio_volume"), &defaults.audio_volume),
         voice_eew: or(nvs_read("voice_eew"), &defaults.voice_eew),
         voice_new: or(nvs_read("voice_new"), &defaults.voice_new),
+        quiet_enable: or(nvs_read("quiet_enable"), &defaults.quiet_enable),
+        quiet_start: or(nvs_read("quiet_start"), &defaults.quiet_start),
+        quiet_end: or(nvs_read("quiet_end"), &defaults.quiet_end),
         wps_enable:    or(nvs_read("wps_enable"),    &defaults.wps_enable),
         ntp_server1:   or(nvs_read("ntp_server1"),   &defaults.ntp_server1),
         ntp_server2:   or(nvs_read("ntp_server2"),   &defaults.ntp_server2),
@@ -549,6 +558,17 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
     <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="notify-eew" onchange="notifySend()"> EEW (緊急地震速報)</label>
     <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="notify-new" onchange="notifySend()"> New earthquake (地震情報)</label>
   </div>
+  <div id="quiet-row" style="display:none;margin-top:12px;gap:10px;flex-wrap:wrap;align-items:center">
+    <span class="stat-key">Quiet hours</span>
+    <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="quiet-on" onchange="quietSend()"> No new-earthquake announcements</label>
+    <span style="display:flex;align-items:center;gap:6px">from
+      <input type="time" id="quiet-start" value="23:00" onchange="quietSend()" style="background:#0f172a;color:#e2e8f0;border:1px solid #2d4a6a;border-radius:6px;padding:4px 6px">
+      to
+      <input type="time" id="quiet-end" value="07:00" onchange="quietSend()" style="background:#0f172a;color:#e2e8f0;border:1px solid #2d4a6a;border-radius:6px;padding:4px 6px">
+      <span style="font-size:.78em;color:#aaa">(JST)</span></span>
+    <span id="quiet-now" class="badge badge-warn" style="display:none">quiet now</span>
+    <p style="width:100%;font-size:.78em;color:#aaa;margin:.2em 0 0">During this daily window the chime and speech for ordinary earthquake reports are skipped; <b>EEW always sounds</b>. A window past midnight (e.g. 23:00 to 07:00) is fine. Applies immediately.</p>
+  </div>
   <div id="voice-row" style="display:none;margin-top:10px;gap:8px;flex-wrap:wrap">
     <button type="button" class="btn" style="background:#b91c1c;flex:0 0 auto" onclick="toneSend('speak=eew')">&#x1F5E3; Test EEW voice</button>
     <button type="button" class="btn" style="background:#b45309;flex:0 0 auto" onclick="toneSend('speak=new')">&#x1F5E3; Test new-quake voice</button>
@@ -816,6 +836,11 @@ function notifySend() {{
   toneSend('notify_eew=' + document.getElementById('notify-eew').checked +
            '&notify_new=' + document.getElementById('notify-new').checked);
 }}
+function quietSend() {{
+  toneSend('quiet_enable=' + document.getElementById('quiet-on').checked +
+           '&quiet_start=' + document.getElementById('quiet-start').value +
+           '&quiet_end=' + document.getElementById('quiet-end').value);
+}}
 function toneToggle() {{ toneSend('on=' + (!toneOn)); }}
 fetch('/api/tone').then(r => r.json()).then(function(d) {{
   toneShow(d);
@@ -824,6 +849,11 @@ fetch('/api/tone').then(r => r.json()).then(function(d) {{
   if (d.running) {{
     document.getElementById('notify-eew').checked = d.notify_eew;
     document.getElementById('notify-new').checked = d.notify_new;
+    document.getElementById('quiet-on').checked = d.quiet_enable;
+    if (document.activeElement.id !== 'quiet-start') document.getElementById('quiet-start').value = d.quiet_start;
+    if (document.activeElement.id !== 'quiet-end') document.getElementById('quiet-end').value = d.quiet_end;
+    document.getElementById('quiet-now').style.display = d.quiet_now ? 'inline-block' : 'none';
+    document.getElementById('quiet-row').style.display = 'flex';
     document.getElementById('notify-row').style.display = 'flex';
     document.getElementById('vol-range').value = d.volume;
     document.getElementById('vol-val').textContent = d.volume + ' %';
@@ -1138,10 +1168,12 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
 
     // ── GET/POST /api/tone — audio test tone frequency / on-off (requires auth) ──
     fn tone_json() -> String {
-        format!(r#"{{"running":{},"hz":{},"on":{},"min":{},"max":{},"voice":{},"volume":{},"notify_eew":{},"notify_new":{}}}"#,
+        format!(r#"{{"running":{},"hz":{},"on":{},"min":{},"max":{},"voice":{},"volume":{},"notify_eew":{},"notify_new":{},"quiet_enable":{},"quiet_start":"{}","quiet_end":"{}","quiet_now":{}}}"#,
             crate::audio::running(), crate::audio::freq_hz(), crate::audio::enabled(),
             crate::audio::FREQ_MIN_HZ, crate::audio::FREQ_MAX_HZ, crate::voice::available(),
-            crate::audio::volume(), crate::voice::notify_eew(), crate::voice::notify_new())
+            crate::audio::volume(), crate::voice::notify_eew(), crate::voice::notify_new(),
+            crate::voice::quiet_enabled(), crate::voice::fmt_hhmm(crate::voice::quiet_start_min()),
+            crate::voice::fmt_hhmm(crate::voice::quiet_end_min()), crate::voice::quiet_now())
     }
     let state_tg = state.clone();
     server.fn_handler("/api/tone", Method::Get, move |request| {
@@ -1183,6 +1215,24 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
                 if is_eew { cfg.voice_eew = on.to_string(); } else { cfg.voice_new = on.to_string(); }
                 nvs_write_all(&cfg);
             }
+        }
+        // Quiet hours for new-earthquake announcements (EEW is never muted):
+        // any of quiet_enable / quiet_start / quiet_end ("HH:MM"), stored in NVS.
+        if form.contains_key("quiet_enable") || form.contains_key("quiet_start") || form.contains_key("quiet_end") {
+            let mut cfg = state_tp.config.lock().unwrap();
+            if let Some(v) = form.get("quiet_enable") { cfg.quiet_enable = (v == "true").to_string(); }
+            for (key, slot) in [("quiet_start", 0), ("quiet_end", 1)] {
+                if let Some(v) = form.get(key).and_then(|v| crate::voice::parse_hhmm(v)) {
+                    let t = crate::voice::fmt_hhmm(v);
+                    if slot == 0 { cfg.quiet_start = t; } else { cfg.quiet_end = t; }
+                }
+            }
+            crate::voice::set_quiet(
+                cfg.quiet_enable == "true",
+                crate::voice::parse_hhmm(&cfg.quiet_start).unwrap_or(23 * 60),
+                crate::voice::parse_hhmm(&cfg.quiet_end).unwrap_or(7 * 60),
+            );
+            nvs_write_all(&cfg);
         }
         // Voice volume (percent): applied at once; `save=1` also stores it in NVS.
         if let Some(vol) = form.get("volume").and_then(|v| v.trim().parse::<u32>().ok()) {

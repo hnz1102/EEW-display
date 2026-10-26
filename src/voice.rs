@@ -15,7 +15,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use log::{info, warn};
 
@@ -62,6 +62,55 @@ pub fn notify_eew() -> bool { NOTIFY_EEW.load(Ordering::Relaxed) }
 pub fn notify_new() -> bool { NOTIFY_NEW.load(Ordering::Relaxed) }
 pub fn set_notify_eew(on: bool) { NOTIFY_EEW.store(on, Ordering::Relaxed); }
 pub fn set_notify_new(on: bool) { NOTIFY_NEW.store(on, Ordering::Relaxed); }
+
+// ─── Quiet hours ─────────────────────────────────────────────────────────────
+// A daily window (JST) in which NEW-EARTHQUAKE announcements are not played.
+// EEWs are never affected: they always sound.
+
+static QUIET_ON: AtomicBool = AtomicBool::new(false);
+/// Start / end of the window in minutes after midnight (JST).
+static QUIET_START: AtomicU32 = AtomicU32::new(23 * 60);
+static QUIET_END: AtomicU32 = AtomicU32::new(7 * 60);
+
+pub fn quiet_enabled() -> bool { QUIET_ON.load(Ordering::Relaxed) }
+pub fn quiet_start_min() -> u32 { QUIET_START.load(Ordering::Relaxed) }
+pub fn quiet_end_min() -> u32 { QUIET_END.load(Ordering::Relaxed) }
+pub fn set_quiet(on: bool, start_min: u32, end_min: u32) {
+    QUIET_START.store(start_min.min(1439), Ordering::Relaxed);
+    QUIET_END.store(end_min.min(1439), Ordering::Relaxed);
+    QUIET_ON.store(on, Ordering::Relaxed);
+}
+
+/// "HH:MM" → minutes after midnight (None if malformed / out of range).
+pub fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.trim().parse().ok()?, m.trim().parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
+/// Minutes → "HH:MM".
+pub fn fmt_hhmm(min: u32) -> String { format!("{:02}:{:02}", min / 60 % 24, min % 60) }
+
+/// Is `minute` (of the day) inside the window [start, end)? A window that runs
+/// past midnight (start > end, e.g. 23:00–07:00) is handled; start == end is an
+/// empty window.
+fn in_window(minute: u32, start: u32, end: u32) -> bool {
+    if start < end { minute >= start && minute < end }
+    else if start > end { minute >= start || minute < end }
+    else { false }
+}
+
+/// true if quiet hours are on and the time of day (JST) is inside the window.
+/// Before the clock has synced (NTP) the time is unknown, so it is NOT quiet:
+/// better an announcement at the wrong hour than a missed one.
+pub fn quiet_now() -> bool {
+    if !quiet_enabled() { return false; }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    if secs < 1_704_067_200 { return false; } // 2024-01-01: the clock is not set yet
+    let minute = ((secs + 9 * 3600) % 86_400 / 60) as u32;
+    in_window(minute, quiet_start_min(), quiet_end_min())
+}
 
 /// true if a voice bank was found and loaded.
 pub fn available() -> bool { BANK.get().is_some() }
@@ -304,9 +353,14 @@ pub fn speak_eew(e: &crate::quake::Eew) {
 }
 
 /// Announce a newly received earthquake: chime + sentence, once (dropped while
-/// an EEW is being played).
+/// an EEW is being played, and during the quiet hours — EEWs ignore those).
 pub fn speak_new(q: &crate::quake::Quake) {
     if !notify_new() { return; }
+    if quiet_now() {
+        info!("[VOICE] quiet hours ({}-{} JST): new-earthquake announcement skipped",
+              fmt_hhmm(quiet_start_min()), fmt_hhmm(quiet_end_min()));
+        return;
+    }
     let v = new_sentence(&q.name, q.mag, q.scale, q.depth, &q.tsunami);
     info!("[VOICE] new-earthquake announcement ({} segments, voice bank: {})", v.len(), available());
     crate::audio::play(v, false);

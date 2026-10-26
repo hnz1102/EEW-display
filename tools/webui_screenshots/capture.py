@@ -82,7 +82,8 @@ def api(eew, view):
         '/api/mapinfo': dict(has_map=True, version=1, center_lat=view[0], center_lon=view[1], center_valid=True, zoom=view[2]),
         '/api/mapkey': dict(api_key='sample', map_type='roadmap'),
         '/api/tone': dict(running=True, hz=1000, on=False, min=100, max=15000, voice=True, volume=70,
-                          notify_eew=True, notify_new=True),
+                          notify_eew=True, notify_new=True,
+                          quiet_enable=True, quiet_start='23:00', quiet_end='07:00', quiet_now=False),
         '/api/boot_log': dict(entries=['#14 PowerOn', '#13 Software', '#12 PowerOn']),
     }
 

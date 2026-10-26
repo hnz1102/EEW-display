@@ -1,6 +1,6 @@
 [package]
 name = "eew-display"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Hiroshi Nakajima <hnakamiru1103@gmail.com>"]
 edition = "2021"
 resolver = "2"

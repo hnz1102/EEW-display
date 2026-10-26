@@ -37,6 +37,9 @@ audio_enable         = "true"
 audio_volume         = "70"      # voice volume, percent (0-100)
 voice_eew            = "true"    # announce EEWs (chime + speech)
 voice_new            = "true"    # announce new earthquakes (chime + speech)
+quiet_enable         = "false"   # "true": no NEW-earthquake announcements between quiet_start and quiet_end (JST); EEW always sounds
+quiet_start          = "23:00"
+quiet_end            = "06:00"
 
 # Google Maps Static API key — get one at https://console.cloud.google.com/ (enable "Maps Static API", see README).
 # This is only the default: the key can also be entered in the Web UI (Config > Map Settings), which overrides it.

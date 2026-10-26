@@ -78,6 +78,12 @@ pub struct Config {
     voice_eew: &'static str,
     #[default("true")]
     voice_new: &'static str,
+    #[default("false")]
+    quiet_enable: &'static str,
+    #[default("23:00")]
+    quiet_start: &'static str,
+    #[default("07:00")]
+    quiet_end: &'static str,
 }
 
 fn main() {
@@ -117,6 +123,9 @@ fn main() {
         audio_volume:  CONFIG.audio_volume.to_string(),
         voice_eew:     CONFIG.voice_eew.to_string(),
         voice_new:     CONFIG.voice_new.to_string(),
+        quiet_enable:  CONFIG.quiet_enable.to_string(),
+        quiet_start:   CONFIG.quiet_start.to_string(),
+        quiet_end:     CONFIG.quiet_end.to_string(),
         ntp_server1:   CONFIG.ntp_server1.to_string(),
         ntp_server2:   CONFIG.ntp_server2.to_string(),
         ntp_server3:   CONFIG.ntp_server3.to_string(),
@@ -171,6 +180,11 @@ fn main() {
         audio::set_volume(nvs_config.audio_volume.trim().parse().unwrap_or(70));
         voice::set_notify_eew(nvs_config.voice_eew != "false");
         voice::set_notify_new(nvs_config.voice_new != "false");
+        voice::set_quiet(
+            nvs_config.quiet_enable == "true",
+            voice::parse_hhmm(&nvs_config.quiet_start).unwrap_or(23 * 60),
+            voice::parse_hhmm(&nvs_config.quiet_end).unwrap_or(7 * 60),
+        );
         voice::init();
         audio::start(
             peripherals.i2s0,

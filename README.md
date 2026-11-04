@@ -2,21 +2,17 @@
   <h1><code>EEW Display</code></h1>
 </div>
 
-![Earthquake list](docs/images/test-bench.jpg)
+![Earthquake list](docs/images/snap.jpg)
 
 ESP32-S3 firmware for a small earthquake-information display.  It shows recent
 earthquakes and emergency earthquake warnings (緊急地震速報, EEW) from
 [P2P地震情報](https://www.p2pquake.net/), draws the epicenters on a Google map,
 and serves the same data (plus configuration) over Wi-Fi to a browser.  The
-display is a 480×320 ILI9488 SPI TFT in landscape orientation; an optional
-MAX98357A amplifier speaks EEWs and new earthquakes in Japanese.  Written in Rust
-(esp-idf-hal / esp-idf-svc).
-
-> This project grew out of a GNSS satellite viewer.  The GNSS receiver, the SSH
-> bridge to it, the eMMC storage (map cache, track log) and the serial terminal
-> have been removed; what remains is the earthquake / EEW viewer.  The KiCad
-> files in [`hw/`](hw/) and the enclosure in [`STL/`](STL/) still describe the
-> earlier GNSS board.
+display is a 480×320 ILI9488 SPI TFT in landscape orientation; a MAX98357A
+amplifier with an on-board speaker speaks EEWs and new earthquakes in Japanese.
+Written in Rust (esp-idf-hal / esp-idf-svc).  The KiCad design of the board is in
+[`hw/`](hw/) and a 3D-printable enclosure in [`STL/`](STL/) (see
+[Hardware](#hardware)).
 
 ## Features
 
@@ -25,7 +21,7 @@ MAX98357A amplifier speaks EEWs and new earthquakes in Japanese.  Written in Rus
 | Earthquake list | The 20 most recent events (8 rows visible, the list scrolls with the highlight): time (JST), magnitude, maximum intensity, depth, epicenter coordinates and tsunami flag |
 | Map | Google Maps Static API tile (satellite or roadmap) filling the screen, with the recent epicenters drawn on it, sized by magnitude and coloured by intensity; Japan overview by default, or centred on the quake picked in the list.  The nearest well-known place, with distance and direction, is shown for the selected / new / EEW epicenter |
 | EEW alert | On a warning the TFT switches to the map by itself, marks the forecast epicenter with a red `X` and shows magnitude, maximum forecast intensity and depth; the Web UI shows a red banner |
-| Voice (optional) | Chime + Japanese spoken announcement of every EEW and every newly received earthquake through a MAX98357A amplifier; each can be switched off, and the volume set, in the Web UI (see [Spoken announcements](#spoken-announcements-japanese)) |
+| Voice | Chime + Japanese spoken announcement of every EEW and every newly received earthquake through the on-board MAX98357A amplifier and speaker; each can be switched off, and the volume set, in the Web UI (see [Spoken announcements](#spoken-announcements-japanese)) |
 | Screen saver / idle clock | After a configurable idle time the backlight goes off, or a full-screen analog clock (JST) is shown; a button press or an EEW / new earthquake returns to the pages (see [Screen saver and idle clock](#screen-saver-and-idle-clock)) |
 | Time sync | NTP (up to 4 servers) |
 | Web UI | Browser-based configuration, earthquake list, map, audio controls |
@@ -36,16 +32,43 @@ MAX98357A amplifier speaks EEWs and new earthquakes in Japanese.  Written in Rus
 
 ## Hardware
 
-| Part | Notes |
-|------|-------|
-| MCU | ESP32-S3 with 16 MB flash and octal PSRAM |
-| Display | **ILI9488 480×320** SPI TFT (4-wire SPI, 18-bit colour), landscape.  No touch, no SD slot used |
-| Battery | Optional LiPo; voltage is read on GPIO11 (see `adc_conversion_factor`).  Shows `--` / no icon when nothing is connected |
-| RTC | 32.768 kHz crystal on GPIO15/16 (falls back to the internal oscillator if absent) |
-| Audio (optional) | MAX98357A I2S amplifier (48 kHz, 16-bit stereo; SD_MODE high = on).  See [Spoken announcements](#spoken-announcements-japanese) |
-| Buttons | BOOT (GPIO0) plus three user buttons (GPIO38/39/40) |
+The unit is a single 2-layer PCB, **EEW DISPLAY Rev.2** (139 × 64 mm), with the
+3.5" TFT module plugged onto it, in a 3D-printed enclosure.
 
-There is no eMMC and no GNSS receiver on this unit.
+| Part | On the board |
+|------|--------------|
+| MCU | ESP32-S3-WROOM-1-N16R8 (16 MB flash, 8 MB octal PSRAM) |
+| Display | **ILI9488 480×320** SPI TFT module (4-wire SPI, 18-bit colour), landscape.  The module's touch controller and SD-card slot are wired to the ESP32 but not used by the firmware |
+| USB | USB-C (USB4105-GF-A): power, charging, and flashing / serial log through the ESP32-S3's native USB (5.1 kΩ CC pull-downs) |
+| Battery | LiPo on a JST PH 2-pin connector, charged by an MCP73831 (500 mA); red LED = charging, green = charged.  A P-MOSFET power path runs the unit from USB when plugged in.  The supply voltage is read on GPIO11 through a 20 k / 20 k divider (see `adc_conversion_factor`) |
+| Power switch | Slide switch (IS-1235-G) in front of the regulator |
+| Regulator | SPX3819 LDO, 3.3 V |
+| RTC | 32.768 kHz crystal on GPIO15/16 (the firmware falls back to the internal oscillator if absent) |
+| Audio | MAX98357A I2S amplifier (48 kHz, 16-bit; SD_MODE high = on) driving an on-board speaker (UM1515IA).  The gain is set by the R12 / R13 option.  See [Spoken announcements](#spoken-announcements-japanese) |
+| Buttons | Four 6 mm tactile switches: PAGE/BOOT (GPIO0), ZOOM-IN (GPIO38), ZOOM-OUT (GPIO39), MODE (GPIO40) |
+
+### Board files ([`hw/`](hw/))
+
+| File | Content |
+|------|---------|
+| [`schematic.pdf`](hw/schematic.pdf) | Schematic |
+| `EEW-display.kicad_sch` / `.kicad_pcb` / `.kicad_pro` | KiCad project |
+| `Library.pretty/` | Project footprints (ESP32-S3 module, TFT module, USB-C, slide switch, speaker, MAX98357A TQFN) |
+| [`BOM.csv`](hw/BOM.csv) | Bill of materials with Digi-Key / Akizuki part numbers |
+| `production/` | Fabrication output: Gerbers (`EEW-display.zip`), assembly BOM, pick-and-place (`positions.csv`), designators, IPC-D-356 netlist |
+
+The hardware design is licensed under CC-BY-SA 4.0 (see the schematic title
+block).
+
+### Enclosure ([`STL/`](STL/))
+
+| File | Part | Size (mm, bounding box) |
+|------|------|------|
+| `cover-v4.stl` | Cover | 161.8 × 86.8 × 31.5 |
+| `body-v4.stl` | Body | 149.4 × 75.4 × 30.5 |
+| `base-v4.stl` | Base | 158.5 × 89.2 × 44.3 |
+| `button.stl` | Button cap (print four, one per tactile switch) | 9.0 × 9.0 × 5.5 |
+| `eew-display.f3d` | Fusion 360 source of all parts | — |
 
 ### Pin assignment
 
@@ -60,7 +83,9 @@ There is no eMMC and no GNSS receiver on this unit.
 | TFT SDO (MISO) | 17 — wired but not used (the panel is write-only here) |
 | Battery voltage (ADC) | 11 |
 | MAX98357A DIN / BCLK / LRCLK (WS) / SD_MODE | 7 / 6 / 5 / 4 |
-| Buttons | 0 (BOOT/Page), 38 (+), 39 (−), 40 (action) — all active-low with internal pull-ups |
+| Buttons | 0 (PAGE/BOOT), 38 (ZOOM-IN, +), 39 (ZOOM-OUT, −), 40 (MODE, action) — all active-low with internal pull-ups |
+| TFT touch: T_CLK / T_CS / T_DIN / T_DO / PEN | 47 / 48 / 45 / 41 / 42 — wired, not used |
+| TFT SD card: CS / SDI / SDO / CLK | 12 / 13 / 14 / 21 — wired, not used |
 
 The ILI9488 only accepts 18-bit colour over SPI, so the firmware keeps a
 RGB565 framebuffer in PSRAM and sends the changed rectangle as 3 bytes per
@@ -84,15 +109,16 @@ The unit starts on the MAP page; a short press of BOOT cycles the pages.
 
 | Button | EARTHQUAKE page | MAP page | SYSTEM INFO |
 |--------|-----------------|----------|-------------|
-| BOOT (GPIO0), short | next page | next page (returns the map to the Japan overview) | next page |
-| BOOT (GPIO0), ≥ 10 s | factory reset (NVS erased, `cfg.toml` defaults restored) | same | same |
-| + (GPIO38) | highlight up | zoom in | zoom in |
-| − (GPIO39) | highlight down | zoom out | zoom out |
-| Action (GPIO40) | show the highlighted epicenter on the MAP | toggle satellite / roadmap | toggle satellite / roadmap |
+| PAGE/BOOT (GPIO0), short | next page | next page (returns the map to the Japan overview) | next page |
+| PAGE/BOOT (GPIO0), ≥ 10 s | factory reset (NVS erased, `cfg.toml` defaults restored) | same | same |
+| ZOOM-IN + (GPIO38) | highlight up | zoom in | zoom in |
+| ZOOM-OUT − (GPIO39) | highlight down | zoom out | zoom out |
+| MODE (GPIO40) | show the highlighted epicenter on the MAP | toggle satellite / roadmap | toggle satellite / roadmap |
 
 While an EEW or a newly received earthquake is shown, BOOT (EXIT) returns to
-the normal view.  Buttons auto-repeat after 400 ms.  When the screen is off
-(see below) the first press only wakes it — its action is not performed.
+the normal view.  Buttons auto-repeat after 400 ms.  While the display is idle
+(backlight off or clock; see below) the first press only wakes it — its action
+is not performed.
 
 ### Status icons
 
@@ -242,7 +268,8 @@ alert path fires right after boot.  Never ship a sandbox build.
 
 ## Spoken announcements (Japanese)
 
-With a MAX98357A fitted (`audio_enable = "true"`) the unit speaks:
+With `audio_enable = "true"` the unit speaks through the on-board MAX98357A and
+speaker:
 
 - **EEW**: a 1.5 s arpeggio chime (seven notes with harmonics, about 20
   frequency components; the pitch steps up at 0.4 s), then
@@ -329,8 +356,8 @@ turned on or off (both on by default; stored in NVS and overriding
 ```
 p2pquake.net ◄── quake.rs (WebSocket: EEW + events, REST fallback)
                     │
-                    ├── display.rs ── ILI9488 driver + RGB565 framebuffer, screen saver
-                    │      └── display_pages.rs (EARTHQUAKE / MAP / SYSTEM INFO drawing)
+                    ├── display.rs ── ILI9488 driver + RGB565 framebuffer, screen saver / idle clock
+                    │      └── display_pages.rs (EARTHQUAKE / MAP / SYSTEM INFO / clock drawing)
                     │             └── place.rs (epicenter → nearest place text)
                     ├── map_display.rs ── persistent fetch worker ──► Google Static Maps (HTTPS)
                     ├── voice.rs ── sentences from the `voice` flash partition
@@ -366,8 +393,8 @@ eew-display/
 │   ├── clock_font/       # PC tool: generates src/clock_font_data.rs from a TTF
 │   └── webui_screenshots/ # Host tool: screenshots of the Web UI pages (see Web UI)
 ├── docs/images/          # README images; tft/ = TFT screenshots, webui/ = Web UI screenshots
-├── hw/                   # KiCad schematic/PCB of the earlier GNSS board
-├── STL/                  # Enclosure of the earlier GNSS board
+├── hw/                   # KiCad schematic / PCB, BOM and fabrication files (see Hardware)
+├── STL/                  # 3D-printable enclosure (STL) + Fusion 360 source
 ├── cfg.toml              # Build-time default configuration (gitignored — contains credentials)
 ├── cfg.toml.tmp          # Template for cfg.toml (safe to commit)
 ├── espflash.toml         # espflash settings (16 MB flash, partition table)
@@ -392,9 +419,7 @@ cp cfg.toml.tmp cfg.toml
 ```
 
 Then edit `cfg.toml` for your environment.  The table name must match the crate
-name, `[eew-display]`, or the values are ignored.  An older `cfg.toml` from the
-GNSS version needs updating: `ssh_user` / `ssh_password` are now `web_user` /
-`web_password`, and `com1_*`, `display_port` and `emmc_enable` are gone.
+name, `[eew-display]`, or the values are ignored.
 
 Every key is optional; a missing key uses the built-in default below.  The
 shipped `cfg.toml.tmp` template already sets `screen_timeout = "300"` and
@@ -406,7 +431,7 @@ shipped `cfg.toml.tmp` template already sets `screen_timeout = "300"` and
 | `screen_timeout` | `"0"` | You want the display to go idle after N seconds without a button press (`0` = never); also in the Web UI |
 | `idle_mode` | `"off"` | What idle shows: `"off"` = backlight off, `"clock"` = analog clock; also in the Web UI |
 | `quake_enable` | `"true"` | You want to turn the earthquake / EEW feed off.  The feed keeps a TLS WebSocket open (~30 KB of internal RAM) and needs Wi-Fi plus a synced clock.  Read at boot only, so rebuild after changing it |
-| `audio_enable` | `"false"` | A MAX98357A is fitted: `"true"` starts the audio output (voice announcements + Web UI test tone) |
+| `audio_enable` | `"false"` (template: `"true"`) | `"true"` starts the audio output (voice announcements + Web UI test tone); set `"false"` to keep the amplifier off |
 | `audio_volume` / `voice_eew` / `voice_new` | `"70"` / `"true"` / `"true"` | Voice volume in percent, and whether EEWs / new earthquakes are announced.  The Web UI overrides these (stored in NVS) |
 | `quiet_enable` / `quiet_start` / `quiet_end` | `"false"` / `"23:00"` / `"07:00"` | Mute new-earthquake announcements (not EEW) between the two times of day, JST; see [Quiet hours](#quiet-hours-new-earthquake-announcements) |
 | `adc_conversion_factor` | `"80.098"` (template: `"437.98"`) | The battery voltage divider differs: voltage = raw ADC reading ÷ this factor |

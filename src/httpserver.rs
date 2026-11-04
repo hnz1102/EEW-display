@@ -36,6 +36,7 @@ pub struct NvsConfig {
     pub web_password:  String,
     pub display_enable: String,
     pub screen_timeout: String,
+    pub idle_mode: String,
     pub audio_volume: String,
     pub voice_eew: String,
     pub voice_new: String,
@@ -108,6 +109,7 @@ fn nvs_write_all(cfg: &NvsConfig) -> bool {
             ("web_password",  &cfg.web_password),
             ("display_enable", &cfg.display_enable),
             ("screen_timeout", &cfg.screen_timeout),
+            ("idle_mode", &cfg.idle_mode),
             ("audio_volume", &cfg.audio_volume),
             ("voice_eew", &cfg.voice_eew),
             ("voice_new", &cfg.voice_new),
@@ -222,6 +224,7 @@ pub fn load_config(defaults: NvsConfig) -> NvsConfig {
         web_password:  or(nvs_read("web_password"),  &defaults.web_password),
         display_enable: or(nvs_read("display_enable"), &defaults.display_enable),
         screen_timeout: or(nvs_read("screen_timeout"), &defaults.screen_timeout),
+        idle_mode: or(nvs_read("idle_mode"), &defaults.idle_mode),
         audio_volume: or(nvs_read("audio_volume"), &defaults.audio_volume),
         voice_eew: or(nvs_read("voice_eew"), &defaults.voice_eew),
         voice_new: or(nvs_read("voice_new"), &defaults.voice_new),
@@ -648,10 +651,15 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
 <div class="card">
   <div class="section-title">&#x1F4FA; Display</div>
   <div class="grid">
-    <div class="field"><label>Screen off after idle (seconds, 0 = always on)</label>
+    <div class="field"><label>Idle after (seconds, 0 = never idle)</label>
       <input type="number" name="screen_timeout" value="{screen_timeout}" min="0" max="86400"></div>
+    <div class="field"><label>When idle</label>
+      <select name="idle_mode">
+        <option value="off"{idle_off_sel}>Display off (backlight)</option>
+        <option value="clock"{idle_clock_sel}>Analog clock</option>
+      </select></div>
   </div>
-  <p style="font-size:.78em;color:#aaa;margin:.4em 0 0">The backlight goes off after this long without a button press, and comes back on at a button press or when an EEW / new earthquake arrives. Applies immediately on Save.</p>
+  <p style="font-size:.78em;color:#aaa;margin:.4em 0 0">After this long without a button press the backlight goes off, or an analog clock (JST) is shown. A button press or an EEW / new earthquake returns to the normal pages. Applies immediately on Save.</p>
 </div>
 
 <!-- NTP Servers -->
@@ -926,6 +934,8 @@ document.getElementById('boot-log-overlay').addEventListener('click', function(e
         web_user      = esc(&cfg.web_user),
         web_password  = esc(&cfg.web_password),
         screen_timeout = esc(&cfg.screen_timeout),
+        idle_off_sel = if cfg.idle_mode == "clock" { "" } else { " selected" },
+        idle_clock_sel = if cfg.idle_mode == "clock" { " selected" } else { "" },
         ntp_server1   = esc(&cfg.ntp_server1),
         ntp_server2   = esc(&cfg.ntp_server2),
         ntp_server3   = esc(&cfg.ntp_server3),
@@ -1049,6 +1059,7 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
         update!(web_password,  "web_password");
         update!(wps_enable,    "wps_enable");
         update!(screen_timeout, "screen_timeout");
+        update!(idle_mode, "idle_mode");
         update!(ntp_server1,   "ntp_server1");
         update!(ntp_server2,   "ntp_server2");
         update!(ntp_server3,   "ntp_server3");
@@ -1068,6 +1079,7 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
 
         // Apply the screen-saver timeout immediately
         crate::display::set_idle_timeout(cfg.screen_timeout.trim().parse().unwrap_or(0));
+        crate::display::set_idle_clock(cfg.idle_mode == "clock");
 
         // Apply syslog hostname/app_name changes immediately (no reboot needed)
         if let Err(e) = crate::syslogger::update_logger_config(&cfg.syslog_host_name, &cfg.syslog_app_name) {

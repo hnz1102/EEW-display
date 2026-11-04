@@ -919,3 +919,281 @@ pub(crate) fn draw_info_page<D: DrawTarget<Color = Rgb565>>(
         draw_legend_row(display, &[Legend::Page("PAGE")], SCREEN_W);
     }
 }
+
+// ─── Idle clock ──────────────────────────────────────────────────────────
+
+/// Full-screen analog clock (JST) for the idle state. `unix_secs` is the
+/// current UTC time; before the clock is set (NTP) only the face is drawn.
+/// The dial is as large as the panel allows (diameter = screen height).
+///
+/// Drawn into an off-screen RGB888 canvas with real alpha blending (gradient
+/// face, metallic bezel, soft drop shadows, bevel highlights), then copied to
+/// the display in one piece. Light comes from the top-left.
+pub(crate) fn draw_clock<D: DrawTarget<Color = Rgb565>>(display: &mut D, unix_secs: u64) {
+    const D_: i32 = SCREEN_H;                 // canvas = dial square
+    const X0: i32 = (SCREEN_W - D_) / 2;
+    let (cx, cy) = (SCREEN_W as f32 / 2.0 - 0.5, SCREEN_H as f32 / 2.0 - 0.5);
+    let r_out = SCREEN_H as f32 / 2.0 - 1.5;  // bezel outer edge
+    let r_face = r_out - 9.0;                 // bezel inner edge / face
+
+    let accent: Rgb = [255.0, 92.0, 24.0];    // 12/3/6/9 marks, second hand
+    let tick: Rgb = [215.0, 218.0, 225.0];
+    let dot: Rgb = [105.0, 110.0, 120.0];
+    let hour_col: Rgb = [20.0, 200.0, 255.0]; // hour hand: cyan
+    let min_col: Rgb = [242.0, 244.0, 248.0]; // minute hand: white
+
+    let mut cv = Canvas::new(X0, 0, D_, D_);
+    // pt(angle clockwise from 12, radius)
+    let pt = |a: f32, r: f32| { let (s, c) = a.sin_cos(); (cx + r * s, cy - r * c) };
+
+    // The dial (face, bezel, marks) never changes: render it once and reuse
+    // it, so each second only the hands are drawn.
+    let mut face = CLOCK_FACE.lock().unwrap();
+    if let Some(px) = face.as_ref() {
+        cv.px.copy_from_slice(px);
+    } else {
+        // ── Face (radial gradient) and bezel (metallic, lit from the top-left) ──
+        for y in 0..D_ {
+            for x in X0..X0 + D_ {
+                let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > r_out + 1.0 { continue; }
+                let (ux, uy) = if d > 0.0 { (dx / d, dy / d) } else { (0.0, 0.0) };
+                let lit = 0.5 - 0.5 * (ux * LIGHT.0 + uy * LIGHT.1); // 1 = facing the light
+                let c = if d <= r_face {
+                    let t = d / r_face;
+                    let mut c = mix([44.0, 47.0, 54.0], [9.0, 10.0, 13.0], t * t);
+                    // the raised bezel shades the inner rim on the lit side
+                    let near = ((d - (r_face - 14.0)) / 14.0).clamp(0.0, 1.0);
+                    let sh = near * near * (0.25 + 0.55 * lit);
+                    c = mix(c, [0.0; 3], sh);
+                    c
+                } else {
+                    // a rounded metal ring: brightest across its crown
+                    let u = ((d - r_face) / (r_out - r_face)).clamp(0.0, 1.0);
+                    let crown = (u * core::f32::consts::PI).sin();
+                    let metal = mix([45.0, 47.0, 53.0], [228.0, 231.0, 238.0], lit);
+                    mix([20.0, 21.0, 24.0], metal, 0.35 + 0.65 * crown)
+                };
+                let cov = (r_out + 0.5 - d).clamp(0.0, 1.0); // anti-aliased outer edge
+                cv.blend(x, y, c, cov);
+            }
+        }
+
+        // ── Dial marks ──
+        for i in 0..60 {
+            let a = i as f32 * core::f32::consts::PI / 30.0;
+            if i % 15 == 0 {
+                let (p, q) = (pt(a, r_face - 36.0), pt(a, r_face - 10.0));
+                cv.raised(p, q, 5.0, accent, 3.0);
+            } else if i % 5 == 0 {
+                let (p, q) = (pt(a, r_face - 26.0), pt(a, r_face - 10.0));
+                cv.raised(p, q, 3.0, tick, 2.5);
+            } else {
+                let p = pt(a, r_face - 10.0);
+                cv.capsule(p, p, 1.5, 1.0, dot, 1.0);
+            }
+        }
+        *face = Some(cv.px.clone());
+    }
+    drop(face);
+
+    let synced = unix_secs >= 1_704_067_200; // 2024-01-01: the clock is set
+    let t = unix_secs + 9 * 3600; // JST
+    if synced {
+        let (h, m, s) = ((t / 3600 % 24) as f32, (t / 60 % 60) as f32, (t % 60) as f32);
+        let pi2 = core::f32::consts::PI * 2.0;
+        let a_s = s / 60.0 * pi2;
+        let a_m = (m + s / 60.0) / 60.0 * pi2;
+        let a_h = ((h % 12.0) + m / 60.0) / 12.0 * pi2;
+
+        // Hands: higher layers cast longer shadows
+        cv.raised(pt(a_h, -16.0), pt(a_h, r_out * 0.50), 7.0, hour_col, 5.0);
+        cv.raised(pt(a_m, -20.0), pt(a_m, r_out * 0.80), 5.0, min_col, 7.0);
+        cv.raised(pt(a_s, -30.0), pt(a_s, r_out * 0.88), 1.6, accent, 9.0);
+
+        // Centre cap: a domed metal button with an accent ring
+        let c = (cx, cy);
+        cv.capsule((cx + 9.0 * LIGHT.0, cy + 9.0 * LIGHT.1), (cx + 9.0 * LIGHT.0, cy + 9.0 * LIGHT.1), 9.0, 6.0, [0.0; 3], 0.6);
+        cv.capsule(c, c, 10.0, 1.0, accent, 1.0);
+        cv.capsule(c, c, 6.0, 1.0, [70.0, 72.0, 78.0], 1.0);
+        let hl = (cx - 2.5 * LIGHT.0, cy - 2.5 * LIGHT.1);
+        cv.capsule(hl, hl, 2.0, 3.0, [255.0; 3], 0.7);
+    }
+
+    // Black side bands, then the dial square
+    fill(display, 0, 0, X0, SCREEN_H, Rgb565::BLACK);
+    fill(display, X0 + D_, 0, SCREEN_W - X0 - D_, SCREEN_H, Rgb565::BLACK);
+    let _ = display.fill_contiguous(
+        &Rectangle::new(Point::new(X0, 0), Size::new(D_ as u32, D_ as u32)),
+        cv.px.iter().map(|p| Rgb565::new(p[0] >> 3, p[1] >> 2, p[2] >> 3)),
+    );
+
+    // ── Date (JST) in the corners, outside the dial ──
+    if synced {
+        let days = (t / 86_400) as i64;
+        let (y, mo, d) = civil_from_days(days);
+        const WD: [&str; 7] = ["THU", "FRI", "SAT", "SUN", "MON", "TUE", "WED"]; // day 0 = 1970-01-01 Thu
+        let wd = (days % 7) as usize;
+        let yellow: Rgb = [255.0, 228.0, 50.0];
+        let wd_col: Rgb = match wd {
+            2 => [50.0, 178.0, 255.0], // Saturday: blue
+            3 => [255.0, 82.0, 70.0],  // Sunday: red
+            _ => yellow,
+        };
+        text_3d(display, &format!("{:02}/{:02}", mo, d), 6, 8, &CLOCK_FONT_L, 3, yellow);
+        text_3d(display, &format!("{:04}", y), 8, 52, &CLOCK_FONT_S, 2, [200.0, 200.0, 200.0]);
+        let w = aa_width(&CLOCK_FONT_L, WD[wd]);
+        text_3d(display, WD[wd], SCREEN_W - 9 - w, 8, &CLOCK_FONT_L, 3, wd_col);
+    }
+}
+
+include!("clock_font_data.rs");
+
+/// Width in pixels of `s` in an [`AaFont`] (unknown characters are skipped).
+fn aa_width(f: &AaFont, s: &str) -> i32 {
+    s.chars().filter_map(|ch| f.glyphs.iter().find(|g| g.0 == ch)).map(|g| g.1).sum()
+}
+
+/// Text in an anti-aliased [`AaFont`], made to look extruded: darker copies
+/// stacked down-right (`depth` px) give it thickness, the face has a
+/// top-to-bottom gradient, a lit top-left edge and a shaded bottom-right edge.
+/// (x, y) = top-left of the face; it is drawn on black.
+fn text_3d<D: DrawTarget<Color = Rgb565>>(display: &mut D, s: &str, x: i32, y: i32, font: &AaFont, depth: i32, c: Rgb) {
+    // Coverage map of the whole string
+    let (w, h) = (aa_width(font, s), font.h);
+    if w <= 0 { return; }
+    let mut cov = vec![0f32; (w * h) as usize];
+    let mut gx0 = 0;
+    for ch in s.chars() {
+        let Some(&(_, gw, data)) = font.glyphs.iter().find(|g| g.0 == ch) else { continue };
+        for gy in 0..h { for gx in 0..gw {
+            cov[(gy * w + gx0 + gx) as usize] = data[(gy * gw + gx) as usize] as f32 / 255.0;
+        }}
+        gx0 += gw;
+    }
+    let cv_at = |mx: i32, my: i32| if mx >= 0 && my >= 0 && mx < w && my < h { cov[(my * w + mx) as usize] } else { 0.0 };
+
+    let mut cv = Canvas::new(x, y, w + depth, h + depth);
+    // Extruded sides, back to front
+    for k in (1..=depth).rev() {
+        let side = mix(c, [0.0; 3], 0.55 + 0.1 * k as f32 / depth as f32);
+        for my in 0..h { for mx in 0..w {
+            let a = cv_at(mx, my);
+            if a > 0.0 { cv.blend(x + mx + k, y + my + k, side, a); }
+        }}
+    }
+    // Face, lit from the top-left using the slope of the coverage
+    for my in 0..h { for mx in 0..w {
+        let a = cv_at(mx, my);
+        if a <= 0.0 { continue; }
+        let t = my as f32 / (h - 1) as f32;
+        let mut col = if t < 0.5 { mix(mix(c, [255.0; 3], 0.45), c, t * 2.0) }
+                      else       { mix(c, mix(c, [0.0; 3], 0.2), (t - 0.5) * 2.0) };
+        let gx = cv_at(mx + 1, my) - cv_at(mx - 1, my);
+        let gy = cv_at(mx, my + 1) - cv_at(mx, my - 1);
+        let l = (gx * LIGHT.0 + gy * LIGHT.1) * 0.5; // > 0: edge faces the light
+        col = if l > 0.0 { mix(col, [255.0; 3], (l * 0.9).min(0.5)) } else { mix(col, [0.0; 3], (-l * 0.6).min(0.35)) };
+        cv.blend(x + mx, y + my, col, a);
+    }}
+    let _ = display.fill_contiguous(&cv.bounding_box(),
+        cv.px.iter().map(|p| Rgb565::new(p[0] >> 3, p[1] >> 2, p[2] >> 3)));
+}
+
+/// Cached dial of the idle clock (see [`draw_clock`]).
+static CLOCK_FACE: Mutex<Option<Vec<[u8; 3]>>> = Mutex::new(None);
+
+/// Direction the light travels (top-left → bottom-right), unit length.
+const LIGHT: (f32, f32) = (0.6, 0.8);
+
+type Rgb = [f32; 3];
+
+fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+/// Off-screen RGB888 canvas (screen coordinates) with alpha blending.
+struct Canvas { x0: i32, y0: i32, w: i32, h: i32, px: Vec<[u8; 3]> }
+
+impl Canvas {
+    fn new(x0: i32, y0: i32, w: i32, h: i32) -> Self {
+        Canvas { x0, y0, w, h, px: vec![[0u8; 3]; (w * h) as usize] }
+    }
+
+    fn blend(&mut self, x: i32, y: i32, c: Rgb, a: f32) {
+        let (lx, ly) = (x - self.x0, y - self.y0);
+        if a <= 0.0 || lx < 0 || ly < 0 || lx >= self.w || ly >= self.h { return; }
+        let a = a.min(1.0);
+        let p = &mut self.px[(ly * self.w + lx) as usize];
+        for k in 0..3 {
+            let v = p[k] as f32;
+            p[k] = (v + (c[k] - v) * a).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+
+    /// Capsule (thick line with round ends) p→q, half-width `r`, edge
+    /// softness `soft` px (1 = crisp anti-aliasing, larger = blurred shadow).
+    fn capsule(&mut self, p: (f32, f32), q: (f32, f32), r: f32, soft: f32, c: Rgb, alpha: f32) {
+        let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+        let len2 = (dx * dx + dy * dy).max(1e-6);
+        let e = r + soft + 1.0;
+        let (bx0, bx1) = ((p.0.min(q.0) - e).floor() as i32, (p.0.max(q.0) + e).ceil() as i32);
+        let (by0, by1) = ((p.1.min(q.1) - e).floor() as i32, (p.1.max(q.1) + e).ceil() as i32);
+        for y in by0.max(self.y0)..=by1.min(self.y0 + self.h - 1) {
+            for x in bx0.max(self.x0)..=bx1.min(self.x0 + self.w - 1) {
+                let (fx, fy) = (x as f32, y as f32);
+                let t = (((fx - p.0) * dx + (fy - p.1) * dy) / len2).clamp(0.0, 1.0);
+                let (ex, ey) = (fx - (p.0 + t * dx), fy - (p.1 + t * dy));
+                let cov = ((r - (ex * ex + ey * ey).sqrt()) / soft + 0.5).clamp(0.0, 1.0);
+                if cov > 0.0 { self.blend(x, y, c, cov * alpha); }
+            }
+        }
+    }
+
+    /// A raised bar: soft drop shadow (`height` px away from the light), the
+    /// body, then a lit ridge on the light side and shade on the far side.
+    fn raised(&mut self, p: (f32, f32), q: (f32, f32), r: f32, c: Rgb, height: f32) {
+        let (sx, sy) = (height * LIGHT.0, height * LIGHT.1);
+        self.capsule((p.0 + sx, p.1 + sy), (q.0 + sx, q.1 + sy), r, 1.0 + height * 0.8, [0.0; 3], 0.55);
+        self.capsule(p, q, r, 1.0, c, 1.0);
+        if r < 2.0 { return; }
+        let (dx, dy) = (q.0 - p.0, q.1 - p.1);
+        let l = (dx * dx + dy * dy).sqrt().max(1e-6);
+        let (mut nx, mut ny) = (-dy / l, dx / l);
+        if nx * LIGHT.0 + ny * LIGHT.1 > 0.0 { nx = -nx; ny = -ny; } // n points at the light
+        let o = r * 0.45;
+        self.capsule((p.0 + nx * o, p.1 + ny * o), (q.0 + nx * o, q.1 + ny * o), r * 0.4, 1.5, [255.0; 3], 0.38);
+        self.capsule((p.0 - nx * o, p.1 - ny * o), (q.0 - nx * o, q.1 - ny * o), r * 0.4, 1.5, [0.0; 3], 0.28);
+    }
+}
+
+impl Dimensions for Canvas {
+    fn bounding_box(&self) -> Rectangle {
+        Rectangle::new(Point::new(self.x0, self.y0), Size::new(self.w as u32, self.h as u32))
+    }
+}
+
+impl DrawTarget for Canvas {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+    fn draw_iter<I: IntoIterator<Item = Pixel<Rgb565>>>(&mut self, pixels: I) -> Result<(), Self::Error> {
+        for Pixel(pt, c) in pixels {
+            let rgb = [(c.r() as f32) * 255.0 / 31.0, (c.g() as f32) * 255.0 / 63.0, (c.b() as f32) * 255.0 / 31.0];
+            self.blend(pt.x, pt.y, rgb, 1.0);
+        }
+        Ok(())
+    }
+}
+
+/// Days since 1970-01-01 → (year, month, day), proleptic Gregorian.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (yoe + era * 400 + if m <= 2 { 1 } else { 0 }, m, d)
+}

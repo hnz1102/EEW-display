@@ -17,6 +17,7 @@ web_user     = "admin"
 web_password = "esp32"
 
 display_enable = "true"
+idle_mode = "off"          # what to show when idle: "off" (backlight off) or "clock" (analog clock)
 screen_timeout = "300"     # backlight off after this many idle seconds (0 = always on); a button or EEW / new quake wakes it
 
 ntp_server1 = "time.aws.com"

@@ -17,7 +17,7 @@
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use esp_idf_hal::{gpio::*, spi, delay::FreeRtos};
 use esp_idf_hal::spi::config::MODE_0;
 use esp_idf_hal::spi::{Dma, SpiDeviceDriver, SpiDriver};
@@ -234,13 +234,18 @@ impl DrawTarget for Ili9488 {
 
 /// Idle seconds before the backlight goes off; 0 = never.
 static IDLE_TIMEOUT_SECS: AtomicU32 = AtomicU32::new(0);
+/// While idle show the analog clock instead of switching the backlight off.
+static IDLE_CLOCK: AtomicBool = AtomicBool::new(false);
 /// Something happened (button, EEW, new earthquake): restart the idle timer / wake up.
 static WAKE: AtomicBool = AtomicBool::new(false);
-/// The backlight is currently off.
+/// The display is idle (backlight off, or the clock showing).
 static SCREEN_OFF: AtomicBool = AtomicBool::new(false);
 
 /// Set the idle timeout in seconds (0 = the screen stays on). Applies at once.
 pub fn set_idle_timeout(secs: u32) { IDLE_TIMEOUT_SECS.store(secs, Ordering::Relaxed); }
+
+/// Choose what idle means: true = analog clock, false = backlight off.
+pub fn set_idle_clock(on: bool) { IDLE_CLOCK.store(on, Ordering::Relaxed); }
 
 /// Restart the idle timer, turning the screen back on if it is off.
 pub fn wake() { WAKE.store(true, Ordering::Relaxed); }
@@ -252,6 +257,10 @@ pub fn wake_if_off() -> bool {
     wake();
     was_off
 }
+
+/// The idle clock's frame is sent this long before its second starts, so the
+/// panel shows it close to the exact second (the full transfer takes ~90 ms).
+const CLOCK_LEAD_MS: u64 = 50;
 
 // ─── Display thread ───────────────────────────────────────────────────────
 
@@ -326,7 +335,11 @@ fn display_task(
     let mut batt_level: u8 = BATT_NONE;
     let mut last_net: (u8, u8) = (255, 255);
     let mut last_activity = Instant::now();
-    let mut screen_off = false;
+    let mut screen_off = false;       // idle (backlight off or clock showing)
+    let mut backlight_off = false;
+    let mut clock_shown = false;
+    let mut prev_clock_sec: u64 = u64::MAX; // second on the panel (MAX = none yet)
+    let mut clock_ready: u64 = 0;           // second pre-rendered in the framebuffer
 
     loop {
         // ── Page change detection ─────────────────────────────────────
@@ -350,19 +363,63 @@ fn display_task(
         // ── Screen saver ──────────────────────────────────────────────
         if WAKE.swap(false, Ordering::Relaxed) { last_activity = Instant::now(); }
         let timeout = IDLE_TIMEOUT_SECS.load(Ordering::Relaxed);
-        let want_off = timeout > 0 && last_activity.elapsed().as_secs() >= timeout as u64;
-        if want_off != screen_off {
-            screen_off = want_off;
-            SCREEN_OFF.store(screen_off, Ordering::Relaxed);
-            if screen_off {
+        let idle = timeout > 0 && last_activity.elapsed().as_secs() >= timeout as u64;
+        let want_dark = idle && !IDLE_CLOCK.load(Ordering::Relaxed);
+        let want_clock = idle && !want_dark;
+        if idle != screen_off {
+            screen_off = idle;
+            SCREEN_OFF.store(idle, Ordering::Relaxed);
+            force_full_redraw = true;
+            println!("Idle {} ({} s)", if idle { "start" } else { "end" }, timeout);
+        }
+        if want_dark != backlight_off {
+            backlight_off = want_dark;
+            if want_dark {
                 let _ = bl.set_low();
-                println!("Screen off after {} s idle", timeout);
             } else {
                 // Everything drawn while it was off was not sent: send it all now.
                 display.mark_all_dirty();
                 display.flush();
                 let _ = bl.set_high();
             }
+        }
+        if want_clock != clock_shown {
+            clock_shown = want_clock;
+            force_full_redraw = true;
+            prev_clock_sec = u64::MAX;
+        }
+
+        // ── Idle clock: owns the whole screen ─────────────────────────
+        // The frame for the next second is rendered ahead into the
+        // framebuffer and sent just before that second starts, so the
+        // second hand moves on time (rendering + the ~90 ms transfer would
+        // otherwise make it lag).
+        if clock_shown {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            // Start sending a little early: the transfer itself takes ~90 ms.
+            let at = (now + Duration::from_millis(CLOCK_LEAD_MS)).as_secs();
+            if prev_clock_sec == u64::MAX || at > clock_ready + 1 || at + 1 < clock_ready {
+                // First frame, or the time jumped (NTP): show the current second now.
+                draw_clock(&mut display, at);
+                display.flush();
+                prev_clock_sec = at;
+                clock_ready = at + 1;
+                let t0 = Instant::now();
+                draw_clock(&mut display, clock_ready);
+                println!("Idle clock: frame rendered in {} ms", t0.elapsed().as_millis());
+            } else if at >= clock_ready {
+                display.flush(); // the pre-rendered frame for `clock_ready`
+                prev_clock_sec = clock_ready;
+                clock_ready += 1;
+                draw_clock(&mut display, clock_ready);
+            }
+            // Sleep until it is time to send the next frame (≤ 50 ms, so a
+            // button or an alert still ends the clock promptly).
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let next = Duration::from_secs(clock_ready) - Duration::from_millis(CLOCK_LEAD_MS);
+            let wait = next.saturating_sub(now).min(Duration::from_millis(50));
+            thread::sleep(wait.max(Duration::from_millis(1)));
+            continue;
         }
 
         let mut map_redrawn = false;
@@ -422,7 +479,7 @@ fn display_task(
 
         // While the backlight is off nothing is sent (the changes pile up in the
         // dirty rectangle and go out in one piece when the screen wakes).
-        if !screen_off { display.flush(); }
+        if !backlight_off { display.flush(); }
         force_full_redraw = false;
         thread::sleep(Duration::from_millis(50));
     }

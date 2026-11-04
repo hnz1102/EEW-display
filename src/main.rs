@@ -56,6 +56,8 @@ pub struct Config {
     display_enable: &'static str,
     #[default("0")]
     screen_timeout: &'static str,
+    #[default("off")]
+    idle_mode: &'static str,
     #[default("time.aws.com")]
     ntp_server1: &'static str,
     #[default("time.google.com")]
@@ -120,6 +122,7 @@ fn main() {
         wps_enable:    CONFIG.wps_enable.to_string(),
         display_enable: CONFIG.display_enable.to_string(),
         screen_timeout: CONFIG.screen_timeout.to_string(),
+        idle_mode:     CONFIG.idle_mode.to_string(),
         audio_volume:  CONFIG.audio_volume.to_string(),
         voice_eew:     CONFIG.voice_eew.to_string(),
         voice_new:     CONFIG.voice_new.to_string(),
@@ -136,6 +139,7 @@ fn main() {
     };
     let mut nvs_config = httpserver::load_config(cfg_defaults.clone());
     display::set_idle_timeout(nvs_config.screen_timeout.trim().parse().unwrap_or(0));
+    display::set_idle_clock(nvs_config.idle_mode == "clock");
     crate::map_display::set_map_type_satellite(nvs_config.map_type == "satellite");
     crate::map_display::set_api_key(&nvs_config.maps_api_key);
 

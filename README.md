@@ -26,7 +26,7 @@ MAX98357A amplifier speaks EEWs and new earthquakes in Japanese.  Written in Rus
 | Map | Google Maps Static API tile (satellite or roadmap) filling the screen, with the recent epicenters drawn on it, sized by magnitude and coloured by intensity; Japan overview by default, or centred on the quake picked in the list.  The nearest well-known place, with distance and direction, is shown for the selected / new / EEW epicenter |
 | EEW alert | On a warning the TFT switches to the map by itself, marks the forecast epicenter with a red `X` and shows magnitude, maximum forecast intensity and depth; the Web UI shows a red banner |
 | Voice (optional) | Chime + Japanese spoken announcement of every EEW and every newly received earthquake through a MAX98357A amplifier; each can be switched off, and the volume set, in the Web UI (see [Spoken announcements](#spoken-announcements-japanese)) |
-| Screen saver | The backlight goes off after a configurable idle time and comes back on a button press or an EEW / new earthquake (see [Screen saver](#screen-saver)) |
+| Screen saver / idle clock | After a configurable idle time the backlight goes off, or a full-screen analog clock (JST) is shown; a button press or an EEW / new earthquake returns to the pages (see [Screen saver and idle clock](#screen-saver-and-idle-clock)) |
 | Time sync | NTP (up to 4 servers) |
 | Web UI | Browser-based configuration, earthquake list, map, audio controls |
 | WPS | Wi-Fi Protected Setup (PBC mode), started at boot when no SSID is set |
@@ -118,15 +118,43 @@ NVS), or with `quiet_enable` / `quiet_start` / `quiet_end` in `cfg.toml`.  The
 log says `quiet hours (23:00-07:00 JST): new-earthquake announcement skipped`
 when a report is muted.
 
-### Screen saver
+### Screen saver and idle clock
 
-`screen_timeout` (seconds; `0` = the screen stays on) switches the backlight off
-after that long without a button press.  It comes back on any button press, an
-EEW, a newly received earthquake or a system message (such as the factory-reset
-countdown).  While it is off nothing is sent to the panel, and the picture is
-brought up to date in one go on wake-up.  Set it in `cfg.toml` or under
-*Display* in the Web UI (applies immediately).  Spoken announcements are
-independent of the screen.
+After `screen_timeout` seconds without a button press (`0` = never idle) the
+display goes idle.  `idle_mode` chooses what idle means:
+
+| `idle_mode` | While idle |
+|-------------|------------|
+| `"off"` (default) | The backlight is switched off.  Nothing is sent to the panel, and the picture is brought up to date in one go on wake-up |
+| `"clock"` | A full-screen analog clock (JST) is shown instead of the pages |
+
+Any button press, an EEW, a newly received earthquake or a system message (such
+as the factory-reset countdown) ends the idle state; the button press that does
+so does nothing else.  Set both under *Display* in the Web UI (applies
+immediately) or in `cfg.toml`.  Spoken announcements are independent of the
+screen.
+
+<p align="center"><img src="docs/images/tft/08-idle-clock.png" width="480" alt="Idle clock"></p>
+
+The clock face fills the panel height: a metallic bezel, a gradient dial with
+orange marks at 12 / 3 / 6 / 9, a cyan hour hand, a white minute hand and an
+orange second hand, all lit from the top-left with soft drop shadows.  The date
+is shown outside the dial — month/day and year top-left, weekday top-right
+(Saturday blue, Sunday red).  Before the clock has synced (NTP) only the face is
+drawn.
+
+Rendering notes:
+
+- The clock is drawn into an off-screen RGB888 canvas with real alpha blending,
+  then converted to RGB565.  The static dial is rendered once and cached
+  (~300 KB PSRAM); each second only the hands are drawn.
+- The frame for the next second is rendered ahead and sent 50 ms before that
+  second starts, so the second hand moves on time.  The serial log prints
+  `Idle clock: frame rendered in N ms` when the clock starts.
+- The date uses anti-aliased glyphs pre-rendered from DejaVu Sans Condensed Bold
+  (`src/clock_font_data.rs`, ~27 KB), since the bitmap fonts look stair-stepped
+  when enlarged.  Regenerate them with
+  `python3 tools/clock_font/gen_clock_font.py [font.ttf]` (needs Pillow).
 
 ### TFT screenshots
 
@@ -141,6 +169,7 @@ stand-in.
 | ![Earthquake list](docs/images/tft/01-quake.png)<br>**EARTHQUAKE** | ![Map overview](docs/images/tft/02-map-overview.png)<br>**MAP** (overview) | ![Map quake focus](docs/images/tft/03-map-quake-focus.png)<br>**MAP** (quake picked from the list) |
 | ![New quake](docs/images/tft/04-map-new-quake.png)<br>**MAP** (new earthquake) | ![EEW](docs/images/tft/05-map-eew.png)<br>**MAP** (EEW) | ![System info](docs/images/tft/06-info.png)<br>**SYSTEM INFO** |
 | ![Waiting](docs/images/tft/01b-quake-waiting.png)<br>**EARTHQUAKE** (waiting for data) | ![System message](docs/images/tft/07-system-message.png)<br>System message overlay | ![Satellite](docs/images/tft/02b-map-overview-satellite.png)<br>**MAP** (satellite) |
+| ![Idle clock](docs/images/tft/08-idle-clock.png)<br>Idle clock (`idle_mode = "clock"`) | | |
 
 ---
 
@@ -318,8 +347,9 @@ btn_ctrl.rs (buttons) · wifi.rs (STA, WPS, reconnect, network state) · boot_lo
 eew-display/
 ├── src/
 │   ├── main.rs           # Entry point, peripheral initialisation
-│   ├── display.rs        # ILI9488 SPI driver, framebuffer, display task, screen saver
-│   ├── display_pages.rs  # Page drawing (earthquake, map, info); no ESP-IDF dependency
+│   ├── display.rs        # ILI9488 SPI driver, framebuffer, display task, screen saver / idle clock
+│   ├── display_pages.rs  # Page drawing (earthquake, map, info, idle clock); no ESP-IDF dependency
+│   ├── clock_font_data.rs # Generated anti-aliased glyphs for the idle clock's date
 │   ├── map_display.rs    # Map tile fetch, JPEG decode, zoom
 │   ├── audio.rs          # MAX98357A I2S output: voice playback (ADPCM) + test tone
 │   ├── voice.rs          # Spoken-announcement sentences from the `voice` partition
@@ -333,6 +363,7 @@ eew-display/
 ├── tools/
 │   ├── voice/            # PC tool: generates voice.bin (Google Cloud TTS) — see Spoken announcements
 │   ├── screenshots/      # Host tool: renders every TFT page to PNG (see below)
+│   ├── clock_font/       # PC tool: generates src/clock_font_data.rs from a TTF
 │   └── webui_screenshots/ # Host tool: screenshots of the Web UI pages (see Web UI)
 ├── docs/images/          # README images; tft/ = TFT screenshots, webui/ = Web UI screenshots
 ├── hw/                   # KiCad schematic/PCB of the earlier GNSS board
@@ -372,7 +403,8 @@ shipped `cfg.toml.tmp` template already sets `screen_timeout = "300"` and
 | Setting | Built-in default | Change it when |
 |---------|---------|----------------|
 | `display_enable` | `"true"` | There is no TFT |
-| `screen_timeout` | `"0"` | You want the backlight off after N idle seconds (`0` = never); also in the Web UI |
+| `screen_timeout` | `"0"` | You want the display to go idle after N seconds without a button press (`0` = never); also in the Web UI |
+| `idle_mode` | `"off"` | What idle shows: `"off"` = backlight off, `"clock"` = analog clock; also in the Web UI |
 | `quake_enable` | `"true"` | You want to turn the earthquake / EEW feed off.  The feed keeps a TLS WebSocket open (~30 KB of internal RAM) and needs Wi-Fi plus a synced clock.  Read at boot only, so rebuild after changing it |
 | `audio_enable` | `"false"` | A MAX98357A is fitted: `"true"` starts the audio output (voice announcements + Web UI test tone) |
 | `audio_volume` / `voice_eew` / `voice_new` | `"70"` / `"true"` / `"true"` | Voice volume in percent, and whether EEWs / new earthquakes are announced.  The Web UI overrides these (stored in NVS) |
@@ -401,6 +433,7 @@ web_user     = "admin"
 web_password = "esp32"
 
 display_enable = "true"
+idle_mode = "off"          # what to show when idle: "off" (backlight off) or "clock" (analog clock)
 screen_timeout = "300"     # backlight off after this many idle seconds (0 = always on)
 
 ntp_server1 = "time.aws.com"
@@ -732,7 +765,7 @@ the `cfg.toml` values, and *Boot Log* shows the reset reasons of the last boots.
 | **WiFi / Network** | SSID and password, WPS enable, DHCP or static IP |
 | **Syslog** | Optional remote logging (server, host name, app name) |
 | **Authentication** | The Web UI user name and password |
-| **Display** | Screen-saver timeout (backlight off after N idle seconds) |
+| **Display** | Idle timeout (seconds) and what to do when idle: switch the backlight off, or show the analog clock |
 | **NTP Servers** | Up to four time servers |
 | **Map Settings** | Map type (satellite / roadmap) and the Google Maps API key |
 
@@ -807,7 +840,7 @@ required: `web_user` / `web_password`).
 
 | Component / Library | Version | License | Purpose |
 |---------------------|---------|---------|---------|
-| **eew-display** (this project) | 0.2.0 | MIT | Firmware (Rust) |
+| **eew-display** (this project) | 0.3.0 | MIT | Firmware (Rust) |
 | esp-idf-hal | 0.45.2 | MIT / Apache-2.0 | ESP32-S3 hardware abstraction (SPI, I2S, GPIO, ADC) |
 | esp-idf-svc | 0.51 | MIT / Apache-2.0 | Wi-Fi, HTTP server/client, WebSocket, SNTP, etc. |
 | esp-idf-sys / ESP-IDF | 0.36 / v5.4.2 | MIT / Apache-2.0 | Bindings and SDK |
@@ -818,6 +851,7 @@ required: `web_user` / `web_password`).
 | serde / serde_json | 1 | MIT / Apache-2.0 | P2P地震情報 JSON |
 | chrono | 0.4 | MIT / Apache-2.0 | Date and time |
 | toml-cfg, heapless, anyhow, log | — | MIT / Apache-2.0 | Build-time config, buffers, errors, logging |
+| DejaVu Sans Condensed Bold | 2.37 | Bitstream Vera / DejaVu (free to embed) | Idle-clock date glyphs, pre-rendered into `src/clock_font_data.rs` |
 
 Map imagery is provided by the Google Maps Static API, earthquake / EEW data by
 P2P地震情報 (originally Japan Meteorological Agency data) and the spoken parts

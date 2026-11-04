@@ -187,6 +187,13 @@ fn main() {
     let batt = 4; // 4 of 5 segments
     let (jp_lat, jp_lon, jp_zoom) = map_display::DEFAULT_VIEW;
 
+    // 0. Idle clock at 2026-11-04 10:08:35 JST (= 01:08:35 UTC)
+    {
+        let mut fb = Fb::new();
+        draw_clock(&mut fb, 1_793_754_515);
+        save("08-idle-clock.png", fb);
+    }
+
     // 1. Earthquake list
     quake::set_quakes(sample_quakes(), 1);
     quake::set_selection(10);

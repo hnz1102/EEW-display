@@ -399,6 +399,7 @@ pub fn start(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4) {
         .stack_size(8192)
         .spawn(move || {
             if let Err(e) = audio_task(i2s, bclk, ws, din, sd, rx) {
+                crate::health::AUDIO.disarm();
                 RUNNING.store(false, Ordering::Relaxed);
                 *PLAY_TX.lock().unwrap() = None;
                 warn!("[AUDIO] stopped: {:?}", e);
@@ -452,7 +453,9 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
     let mut last_wr = std::time::Instant::now();
     let (mut max_gap, mut max_gen, mut gap_at, mut gap_t) = (0u128, 0u128, 0u32, 0i64);
     let mut chunks = 0u32;
+    let hb = &crate::health::AUDIO;
     loop {
+        hb.mark(crate::health::a::RECV);
         // New sentence? An EEW sentence is never cut off by a non-EEW one.
         while let Ok(pb) = rx.try_recv() {
             if player.as_ref().map(|p| p.eew).unwrap_or(false) && !pb.eew { continue; }
@@ -472,6 +475,7 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
 
         PLAYING.store(player.is_some(), Ordering::Relaxed);
         let gen_t = std::time::Instant::now();
+        hb.mark(crate::health::a::SYNTH);
         if let Some(p) = player.as_mut() {
             let vol = VOLUME.load(Ordering::Relaxed) as i32;
             let mut done = false;
@@ -505,6 +509,7 @@ fn audio_task(i2s: i2s::I2S0, bclk: Gpio6, ws: Gpio5, din: Gpio7, sd: Gpio4,
             }
         }
         let gen_ms = gen_t.elapsed().as_millis();
+        hb.mark(crate::health::a::I2S_WRITE);
         tx.write_all(&buf, BLOCK)?;
         if player.is_some() {
             let gap = last_wr.elapsed().as_millis();

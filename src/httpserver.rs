@@ -511,6 +511,7 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
 <div class="card" id="quake-box" style="display:none">
   <div class="section-title">&#x1F30B; Recent Earthquakes</div>
   <div id="eew-banner" style="display:none;background:#7f1d1d;color:#fff;padding:10px;border-radius:6px;margin-bottom:8px;font-weight:600"></div>
+  <div id="prompt-banner" style="display:none;background:#9a3412;color:#fff;padding:10px;border-radius:6px;margin-bottom:8px;font-weight:600"></div>
   <div id="quake-card" style="overflow-x:auto">Loading...</div>
   <div style="font-size:11px;color:#64748b;margin-top:6px">出典: 気象庁の情報を利用 / P2P地震情報 (<a href="https://www.p2pquake.net/" target="_blank" rel="noopener">p2pquake.net</a>) &mdash; Source: JMA via P2PQuake</div>
 </div>
@@ -574,6 +575,7 @@ hr{{border:none;border-top:1px solid #1e3a5f;margin:10px 0}}
   </div>
   <div id="voice-row" style="display:none;margin-top:10px;gap:8px;flex-wrap:wrap">
     <button type="button" class="btn" style="background:#b91c1c;flex:0 0 auto" onclick="toneSend('speak=eew')">&#x1F5E3; Test EEW voice</button>
+    <button type="button" class="btn" style="background:#c2410c;flex:0 0 auto" onclick="toneSend('speak=prompt')">&#x1F5E3; Test 震度速報 voice</button>
     <button type="button" class="btn" style="background:#b45309;flex:0 0 auto" onclick="toneSend('speak=new')">&#x1F5E3; Test new-quake voice</button>
   </div>
 </div>
@@ -782,6 +784,13 @@ function updateQuakes() {{
       b.appendChild(a);
     }}
     }} else {{ b.style.display = 'none'; }}
+    var pb = document.getElementById('prompt-banner');
+    if (d.prompt) {{
+      pb.style.display = 'block';
+      pb.textContent = '\u9707\u5EA6\u901F\u5831 ' + d.prompt.time + ' \u6700\u5927\u9707\u5EA6' + d.prompt.intensity +
+        ' / ' + d.prompt.areas.join('\u3001') + (d.prompt.n_areas > d.prompt.areas.length ? ' \u307B\u304B' : '') +
+        ' (\u9707\u6E90\u306F\u8ABF\u67FB\u4E2D)';
+    }} else {{ pb.style.display = 'none'; }}
     if (!d.quakes.length) {{
       document.getElementById('quake-card').textContent = d.ready ? 'No events' : 'Waiting for data...';
       return;
@@ -1464,8 +1473,16 @@ pub fn start_http_server(state: ConfigState) -> anyhow::Result<EspHttpServer<'st
             }
             None => "null".to_string(),
         };
-        let json = format!(r#"{{"enabled":{},"ready":{},"eew":{},"quakes":[{}]}}"#,
-            crate::quake::enabled(), crate::quake::last_ok_secs() != 0, eew, items.join(","));
+        let prompt = match crate::quake::prompt() {
+            Some(p) => format!(r#"{{"time":{t},"intensity":{i},"areas":{a},"n_areas":{n}}}"#,
+                t = serde_json::to_string(&p.time).unwrap_or_default(),
+                i = serde_json::to_string(p.intensity_jp()).unwrap_or_default(),
+                a = serde_json::to_string(&p.areas).unwrap_or_default(),
+                n = p.n_areas),
+            None => "null".to_string(),
+        };
+        let json = format!(r#"{{"enabled":{},"ready":{},"eew":{},"prompt":{},"quakes":[{}]}}"#,
+            crate::quake::enabled(), crate::quake::last_ok_secs() != 0, eew, prompt, items.join(","));
         let headers = [("Content-Type", "application/json; charset=utf-8"), ("Cache-Control", "no-store")];
         request.into_response(200, Some("OK"), &headers)?
             .write_all(json.as_bytes())?;

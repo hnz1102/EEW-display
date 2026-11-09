@@ -426,6 +426,7 @@ pub(crate) fn draw_map_page<D: DrawTarget<Color = Rgb565>>(
     let quake_focus = crate::quake::focus();
     let eew = crate::quake::eew();
     let newq = crate::quake::new_quake();
+    let prompt = crate::quake::prompt();
 
     // Where the map should be centred: the focused epicenter, else the Japan overview.
     let (want_lat, want_lon) = match quake_focus {
@@ -611,6 +612,14 @@ pub(crate) fn draw_map_page<D: DrawTarget<Color = Rgb565>>(
         l2 = crate::place::describe(q.lat, q.lon);
         l3 = format!("{} Z{}", fmt_latlon(q.lat, q.lon), zoom);
         l4 = format!("{} {}", q.time.get(5..16).unwrap_or(&q.time), tsunami_short(&q.tsunami));
+    } else if let Some(p) = prompt.as_ref() {
+        // 震度速報: intensity known, epicenter not yet (area names are Japanese:
+        // the ASCII font can't show them, the Web UI does).
+        c1 = Rgb565::CSS_ORANGE;
+        l1 = format!("SHINDO REPORT Imax {}", p.intensity());
+        l2 = "Epicenter: pending".to_string();
+        l3 = format!("{} area(s) at Imax", p.areas.len());
+        l4 = format!("Quake {}", p.time.get(11..19).unwrap_or(&p.time));
     } else if let Some(q) = quake_focus.and_then(|(fl, fo)| {
         crate::quake::get().into_iter().find(|q| (q.lat - fl).abs() < 1e-6 && (q.lon - fo).abs() < 1e-6)
     }) {
@@ -643,6 +652,8 @@ pub(crate) fn draw_map_page<D: DrawTarget<Color = Rgb565>>(
         (format!("!! EEW M{:.1} I{} !!", e.mag.max(0.0), e.intensity()), Rgb565::RED)
     } else if let Some(q) = newq.as_ref() {
         (format!("NEW QUAKE M{:.1} I{}", q.mag.max(0.0), q.intensity()), Rgb565::YELLOW)
+    } else if let Some(p) = prompt.as_ref() {
+        (format!("SHINDO {} (no epicenter yet)", p.intensity()), Rgb565::CSS_ORANGE)
     } else {
         (format!("MAP {}/{}", PAGE_MAP + 1, PAGE_COUNT), Rgb565::CSS_LIGHT_GREEN)
     };
@@ -707,7 +718,11 @@ pub(crate) fn draw_quake_page<D: DrawTarget<Color = Rgb565>>(
                else if crate::quake::ws_connected() { "live" }
                else if crate::quake::last_ok_secs() == 0 { "waiting" }
                else { "polling" };
-    sigs.push(if quakes.is_empty() {
+    let prompt = crate::quake::prompt();
+    sigs.push(if let Some(p) = prompt.as_ref() {
+        // 震度速報 waiting for its epicenter report.
+        format!("SHINDO Imax {} at {}, epicenter pending", p.intensity(), p.time.get(11..16).unwrap_or(&p.time))
+    } else if quakes.is_empty() {
         format!("Recent quakes: 0  [{}]", feed)
     } else {
         format!("Recent quakes: {}  [{}]  #{}/{}", quakes.len(), feed, sel + 1, quakes.len())
@@ -734,8 +749,11 @@ pub(crate) fn draw_quake_page<D: DrawTarget<Color = Rgb565>>(
     // Status line
     if changed(0) {
         fill(display, 0, QUAKE_STATUS_Y, SCREEN_W, QUAKE_STATUS_H, Rgb565::BLACK);
-        text(display, &sigs[0], 4, QUAKE_STATUS_Y + 17, &FONT_8X13, Rgb565::CSS_LIGHT_GREEN);
-        text(display, "JMA via P2P", SCREEN_W - 11 * INFO_CHAR_W - 4, QUAKE_STATUS_Y + 17, &FONT_8X13, DIM);
+        let col = if prompt.is_some() { Rgb565::CSS_ORANGE } else { Rgb565::CSS_LIGHT_GREEN };
+        text(display, &sigs[0], 4, QUAKE_STATUS_Y + 17, &FONT_8X13, col);
+        if prompt.is_none() {
+            text(display, "JMA via P2P", SCREEN_W - 11 * INFO_CHAR_W - 4, QUAKE_STATUS_Y + 17, &FONT_8X13, DIM);
+        }
     }
 
     // List rows

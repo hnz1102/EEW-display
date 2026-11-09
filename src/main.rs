@@ -18,6 +18,7 @@ mod btn_ctrl;
 mod boot_log;
 mod map_display;
 mod quake;
+mod health;
 mod place;
 mod audio;
 mod voice;
@@ -335,6 +336,7 @@ fn main() {
     let dt_now : DateTime<Utc> = now.into();
     let formatted = format!("{}", dt_now.format("%Y-%m-%d %H:%M:%S"));
     info!("NTP Sync Completed: {}", formatted);
+    health::report_previous();
 
     // ── Battery voltage ADC init (GPIO11) ────────────────────────
     // GPIO11 only exists on the ESP32-S3's ADC2 hardware unit (ADC2_CH0), so the
@@ -409,6 +411,7 @@ fn main() {
                 }
             }
         }
+        health::tick();
         count = count.wrapping_add(1);
         thread::sleep(Duration::from_millis(100));
     }

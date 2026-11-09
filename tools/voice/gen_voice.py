@@ -108,6 +108,10 @@ def phrases():
     add('p:no_tsunami', 'この地震による津波の心配はありません。', 0.3)
     add('p:minor_tsunami', '若干の海面変動があるかもしれませんが、被害の心配はありません。', 0.3)
     add('p:tsunami', '津波に関する情報に注意してください。', 0.3)
+    # 震度速報 (intensity report before the epicenter is known)
+    add('p:sokuho', '震度速報。', 0.35)
+    add('p:area_lead', '最大震度を観測した地域は、', 0.08)
+    add('p:nado', 'などです。', 0.35)
     for k, t, y in INTENS:
         add('i:' + k, '<sub alias="%s">%s</sub>。' % (y, t), 0.3)
     for n in range(100):

@@ -223,3 +223,22 @@
 与那国島	よなぐにじま
 先島諸島	さきしましょとう
 東シナ海	ひがしシナかい
+
+# --- 震度速報 areas (JMA intensity-report sub-regions not covered above;
+#     checked against the area names in the P2P ScalePrompt history)
+小笠原	おがさわら
+中・西部	ちゅう、せいぶ
+２３区	にじゅうさんく
+久米島	くめじま
+西表島	いりおもてじま
+天草・芦北	あまくさ、あしきた
+熊本	くまもと
+球磨	くま
+阿蘇	あそ
+北九州	きたきゅうしゅう
+福岡	ふくおか
+筑後	ちくご
+筑豊	ちくほう
+五島	ごとう
+奄美	あまみ
+甑島	こしきじま

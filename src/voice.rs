@@ -212,6 +212,28 @@ fn region(v: &mut Vec<Clip>, name: &str) -> bool {
     v.len() > before
 }
 
+/// Like `region`, but all or nothing: false (and nothing pushed) unless the
+/// whole name could be spoken.
+fn region_full(v: &mut Vec<Clip>, name: &str) -> bool {
+    let Some(b) = BANK.get() else { return false };
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < chars.len() {
+        if chars[pos] == '・' || chars[pos] == ' ' { pos += 1; continue; }
+        let hit = (1..=b.max_tok.min(chars.len() - pos)).rev().find_map(|len| {
+            let cand: String = chars[pos..pos + len].iter().collect();
+            b.get(&format!("t:{}", cand)).map(|c| (c, len))
+        });
+        match hit {
+            Some((c, len)) => { out.push(c); pos += len; }
+            None => return false,
+        }
+    }
+    v.extend(out);
+    !chars.is_empty()
+}
+
 fn magnitude(v: &mut Vec<Clip>, mag: f32) {
     if !(0.0..10.0).contains(&mag) { return; }
     let tenths = (mag * 10.0).round() as i32;
@@ -332,6 +354,39 @@ fn eew_sentence(name: &str, mag: f32, max_scale: i32) -> Vec<Seg> {
     v
 }
 
+/// 震度速報: "震度速報。最大 震度3。最大震度を観測した地域は、A、B などです。"
+/// An area is only spoken when every part of its name is in the bank (a
+/// truncated area name would name the wrong place); the list ends with など
+/// when areas were left out.
+fn prompt_sentence(max_scale: i32, areas: &[String]) -> Vec<Seg> {
+    let mut v = Vec::new();
+    info_chime(&mut v);
+    let mut c = Vec::new();
+    push(&mut c, "p:sokuho");
+    intensity(&mut c, max_scale);
+    speech(&mut v, c);
+    let mut spoken = 0;
+    for a in areas.iter().take(crate::quake::PROMPT_AREAS_MAX) {
+        let mut c = Vec::new();
+        if !region_full(&mut c, a) { continue; }
+        if spoken == 0 {
+            let mut lead = Vec::new();
+            push(&mut lead, "p:area_lead");
+            speech(&mut v, lead);
+        } else {
+            v.push(Seg::Silence { ms: 180 });
+        }
+        speech(&mut v, c);
+        spoken += 1;
+    }
+    if spoken > 0 {
+        let mut c = Vec::new();
+        push(&mut c, if spoken < areas.len() { "p:nado" } else { "p:desu" });
+        speech(&mut v, c);
+    }
+    v
+}
+
 fn new_sentence(name: &str, mag: f32, scale: i32, d: i32, tsunami: &str) -> Vec<Seg> {
     let mut v = Vec::new();
     info_chime(&mut v);
@@ -366,10 +421,28 @@ pub fn speak_new(q: &crate::quake::Quake) {
     crate::audio::play(v, false);
 }
 
-/// Play a sample announcement (Web UI test buttons). `kind` = "eew" | "new".
+/// Announce a 震度速報 (intensity report without epicenter): same rules as
+/// `speak_new` (notify setting, quiet hours).
+pub fn speak_prompt(p: &crate::quake::Prompt) {
+    if !notify_new() { return; }
+    if quiet_now() {
+        info!("[VOICE] quiet hours ({}-{} JST): 震度速報 announcement skipped",
+              fmt_hhmm(quiet_start_min()), fmt_hhmm(quiet_end_min()));
+        return;
+    }
+    let v = prompt_sentence(p.max_scale, &p.areas);
+    info!("[VOICE] 震度速報 announcement ({} segments, voice bank: {})", v.len(), available());
+    crate::audio::play(v, false);
+}
+
+/// Play a sample announcement (Web UI test buttons). `kind` = "eew" | "new" | "prompt".
 pub fn speak_sample(kind: &str) -> bool {
     if kind == "eew" {
         crate::audio::play(eew_sentence("福島県沖", 6.1, 55), true)
+    } else if kind == "prompt" {
+        let areas = ["福島県中通り", "福島県浜通り", "茨城県北部", "栃木県南部", "宮城県中部"]
+            .map(String::from);
+        crate::audio::play(prompt_sentence(30, &areas), false)
     } else {
         crate::audio::play(new_sentence("茨城県南部", 4.6, 40, 50, "None"), false)
     }

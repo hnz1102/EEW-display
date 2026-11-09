@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 
 use log::*;
+use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use esp_idf_svc::ws::client::{EspWebSocketClient, EspWebSocketClientConfig, WebSocketEventType};
@@ -18,6 +19,7 @@ use embedded_svc::http::Method;
 use embedded_svc::io::Read;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use serde::Deserialize;
+use crate::health;
 
 /// How many recent events are kept / shown.
 pub const QUAKE_MAX: usize = 20;
@@ -32,8 +34,11 @@ const EEW_SHOW_SECS: u64 = 120;
 /// Skip a poll when internal RAM is this low: TLS setup would starve the
 /// WiFi/lwIP stack (internal heap is the scarce resource on this board).
 const MIN_INTERNAL_FREE: u32 = 36 * 1024;
-/// Upper bound on one response body (QUAKE_MAX events incl. per-station points).
-const BODY_MAX: usize = 320 * 1024;
+/// Upper bound on one response body (QUAKE_MAX events incl. per-station points;
+/// lives in PSRAM). One DetailScale of a large event is ~80 KB (M5.7 of
+/// 2026-11-08 / M6.1 of 2026-11-06), and the history holds several reports of
+/// it, so the old 320 KB limit made every re-sync fail for hours afterwards.
+const BODY_MAX: usize = 1536 * 1024;
 
 // `--features quake-sandbox` points at the P2P sandbox (replays old 551/556
 // data, e.g. a 2023 Hokkaido EEW) and skips the EEW freshness check, so the
@@ -50,10 +55,14 @@ const URL_WS: &str = "wss://api.p2pquake.net/v2/ws";
 /// WebSocket receive buffer. >4 KB lands in PSRAM (SPIRAM_MALLOC_ALWAYSINTERNAL),
 /// and a large EEW (100+ areas) is ~16 KB, so keep it comfortably above that.
 const WS_BUF: usize = 32 * 1024;
-/// Max size of one reassembled WebSocket message we keep.
-const WS_MSG_MAX: usize = 64 * 1024;
+/// Max size of one reassembled WebSocket message we keep (in PSRAM). A
+/// DetailScale for a large event lists ~1000 stations: the M6.1 of 2026-11-06
+/// was 77 KB, which the old 64 KB limit silently dropped.
+const WS_MSG_MAX: usize = 256 * 1024;
 /// Free internal RAM needed before (re)creating the WebSocket client.
 const WS_MIN_INTERNAL_FREE: u32 = 44 * 1024;
+/// Restart the chip when no WebSocket has been connected for this long.
+const WS_MISSING_RESTART_SECS: u64 = 30 * 60;
 const URL_EEW:   &str = api!("/v2/history?codes=556&limit=1");
 
 #[derive(Clone, Debug)]
@@ -328,6 +337,9 @@ fn merge_pushed(body: &[u8]) {
     let is_new = !cur.iter().any(|o| o.time == q.time && o.lat == q.lat && o.lon == q.lon);
     cur.retain(|o| !(o.time == q.time && o.lat == q.lat && o.lon == q.lon));
     info!("[QUAKE] pushed: {} M{:.1} {}", q.time, q.mag, q.name);
+    if PROMPT.lock().unwrap().as_ref().map(|p| p.time == q.time).unwrap_or(false) {
+        clear_prompt("epicenter report arrived");
+    }
     cur.insert(0, q.clone());
     cur.truncate(QUAKE_MAX);
     VERSION.fetch_add(1, Ordering::Relaxed);
@@ -411,6 +423,109 @@ fn handle_eew(body: &[u8], last_id: &mut String) {
     EEW_VERSION.fetch_add(1, Ordering::Relaxed);
 }
 
+// ─── 震度速報 (ScalePrompt) ─────────────────────────────────────────────────────
+//
+// JMA's first report, ~1.5-2.5 min after the shaking: maximum intensity and the
+// areas that felt it, but no epicenter yet (lat/lon -200) — so it does not go
+// into the list. It is announced and shown as a banner until the report with
+// the epicenter (Destination / DetailScale) for the same event arrives, which
+// is announced as usual. (2026-11-09 13:52 M5.9: ScalePrompt 13:54:31, but the
+// first announcement only came with the DetailScale at 13:59.)
+
+/// A banner lasts at most this long if no epicenter report follows.
+const PROMPT_SHOW_SECS: u64 = 15 * 60;
+/// Ignore 震度速報 for events older than this (e.g. a delayed delivery).
+const PROMPT_FRESH_SECS: i64 = 20 * 60;
+/// How many max-intensity areas are spoken / listed.
+pub const PROMPT_AREAS_MAX: usize = 4;
+
+#[derive(Clone, Debug)]
+pub struct Prompt {
+    pub time:      String,      // origin time, JST "YYYY/MM/DD HH:MM:SS"
+    pub max_scale: i32,
+    pub areas:     Vec<String>, // areas at the maximum intensity, in report order
+    pub n_areas:   usize,       // all areas in the report
+    expires: u64,
+}
+impl Prompt {
+    pub fn intensity(&self) -> &'static str { scale_str(self.max_scale, false) }
+    pub fn intensity_jp(&self) -> &'static str { scale_str(self.max_scale, true) }
+}
+static PROMPT: Mutex<Option<Prompt>> = Mutex::new(None);
+
+/// The 震度速報 waiting for its epicenter report, if any.
+pub fn prompt() -> Option<Prompt> {
+    let g = PROMPT.lock().unwrap();
+    let p = g.as_ref()?;
+    if now_secs() < p.expires { Some(p.clone()) } else { None }
+}
+
+fn clear_prompt(reason: &str) {
+    if let Some(p) = PROMPT.lock().unwrap().take() {
+        info!("[QUAKE] 震度速報 {} cleared ({})", p.time, reason);
+        NEWQ_VERSION.fetch_add(1, Ordering::Relaxed); // redraw the screens
+    }
+}
+
+#[derive(Deserialize)]
+struct PromptPoint {
+    addr:  Option<String>,
+    scale: Option<i32>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptEq {
+    time:             Option<String>,
+    max_scale:        Option<i32>,
+}
+#[derive(Deserialize)]
+struct PromptItem {
+    earthquake: Option<PromptEq>,
+    points:     Option<Vec<PromptPoint>>,
+}
+
+fn handle_prompt(body: &[u8]) {
+    let it = match serde_json::from_slice::<PromptItem>(body) {
+        Ok(it) => it,
+        Err(e) => { info!("[QUAKE] 震度速報 json: {:?}", e); return; }
+    };
+    let Some(eq) = it.earthquake else { return };
+    let time = eq.time.unwrap_or_default();
+    let fresh = cfg!(feature = "quake-sandbox") || jst_to_unix(&time)
+        .map(|t| (now_secs() as i64 - t).abs() <= PROMPT_FRESH_SECS)
+        .unwrap_or(false);
+    if !fresh { info!("[QUAKE] stale 震度速報 ({}) ignored", time); return; }
+    // The epicenter report for this event already came: nothing to add.
+    if QUAKES.lock().unwrap().iter().any(|q| q.time == time) { return; }
+
+    let points = it.points.unwrap_or_default();
+    let max_scale = eq.max_scale.filter(|&s| s > 0)
+        .or_else(|| points.iter().filter_map(|p| p.scale).max())
+        .unwrap_or(-1);
+    let mut areas: Vec<String> = Vec::new();
+    for p in &points {
+        if p.scale == Some(max_scale) {
+            if let Some(a) = &p.addr { if !areas.contains(a) { areas.push(a.clone()); } }
+        }
+    }
+    let prompt = Prompt {
+        time, max_scale, areas, n_areas: points.len(),
+        expires: now_secs() + PROMPT_SHOW_SECS,
+    };
+    info!("[QUAKE] 震度速報: {} max {} at {} ({} areas)",
+          prompt.time, prompt.intensity_jp(), prompt.areas.join("、"), prompt.n_areas);
+
+    // A follow-up 震度速報 (more areas) only speaks again if the maximum went up.
+    let prev = PROMPT.lock().unwrap().as_ref()
+        .filter(|p| p.time == prompt.time && now_secs() < p.expires)
+        .map(|p| p.max_scale);
+    let speak = prev.map(|s| prompt.max_scale > s).unwrap_or(true);
+    *PROMPT.lock().unwrap() = Some(prompt.clone());
+    NEWQ_VERSION.fetch_add(1, Ordering::Relaxed); // wakes and redraws the TFT
+    crate::display::wake();
+    if speak { crate::voice::speak_prompt(&prompt); }
+}
+
 fn clear_eew() {
     *EEW.lock().unwrap() = None;
     EEW_VERSION.fetch_add(1, Ordering::Relaxed);
@@ -449,7 +564,11 @@ fn http_get(slot: &mut Option<HttpClient>, url: &str) -> Option<Vec<u8>> {
         let request = client.request(Method::Get, url, &headers)
             .map_err(|e| info!("[QUAKE] request: {:?}", e)).ok()?;
         let mut response = request.submit()
-            .map_err(|e| info!("[QUAKE] submit: {:?}", e)).ok()?;
+            .map_err(|e| {
+                // 0x7007 = ESP_ERR_HTTP_EAGAIN: no response within the timeout.
+                let hint = if e.0.code().abs() == esp_idf_sys::ESP_ERR_HTTP_EAGAIN { " (timeout, no response)" } else { "" };
+                info!("[QUAKE] submit: {:?}{}", e, hint)
+            }).ok()?;
         if response.status() != 200 {
             info!("[QUAKE] HTTP {}", response.status());
             return None;
@@ -490,9 +609,11 @@ fn internal_free() -> u32 {
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
-/// Fragments of a WebSocket message being reassembled (static so that the
-/// callback captures nothing — see `drop_ws`).
-static WS_PARTIAL: Mutex<String> = Mutex::new(String::new());
+/// Bytes of the WebSocket message being reassembled, filled by `ws_raw_data`
+/// (static so that no callback captures anything — see `drop_ws`).
+static WS_RX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// The message being received is over WS_MSG_MAX: drop the rest of it.
+static WS_RX_SKIP: AtomicBool = AtomicBool::new(false);
 static WS_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// True while a WebSocket client object exists (connected or reconnecting).
 static WS_ALIVE: AtomicBool = AtomicBool::new(false);
@@ -522,19 +643,120 @@ pub fn release_ws_for_map() {
     }
     warn!("[WS] release for map fetch timed out");
 }
-/// Newest complete code-556 message received over the WebSocket, waiting for
-/// the quake thread (the WS task has a small stack, so it only hands it over).
-static WS_EEW_PENDING: Mutex<Option<String>> = Mutex::new(None);
-/// Newest complete code-551 message received over the WebSocket.
-static WS_QUAKE_PENDING: Mutex<Option<String>> = Mutex::new(None);
+/// Complete code-551/556 messages received over the WebSocket, oldest first,
+/// waiting for the quake thread (the WS task has a small stack, so it only
+/// hands them over). An event comes as a burst (ScalePrompt, Destination,
+/// DetailScale, EEW updates), so keep them all, not just the newest.
+static WS_PENDING: Mutex<VecDeque<(u16, String)>> = Mutex::new(VecDeque::new());
+const WS_PENDING_MAX: usize = 8;
 
-fn ws_dispatch(msg: &str) {
+/// Messages received over the WebSocket (all codes) and when the last one came
+/// (uptime s) — shown in the [DIAG] line, to tell a silent socket from a quiet day.
+static WS_RX_COUNT: AtomicU32 = AtomicU32::new(0);
+static WS_RX_LAST: AtomicU32 = AtomicU32::new(0);
+pub fn ws_rx_stats() -> (u32, u32) {
+    (WS_RX_COUNT.load(Ordering::Relaxed), WS_RX_LAST.load(Ordering::Relaxed))
+}
+
+/// Value of the first `"key":` in a JSON message, as raw text (no parsing:
+/// runs on the small-stack WS task).
+fn json_peek<'a>(msg: &'a [u8], key: &[u8]) -> Option<&'a str> {
+    let i = msg.windows(key.len()).position(|w| w == key)? + key.len();
+    let rest = &msg[i..];
+    let rest = rest.strip_prefix(b"\"").unwrap_or(rest);
+    let end = rest.iter().position(|&b| matches!(b, b'"' | b',' | b'}')).unwrap_or(rest.len());
+    core::str::from_utf8(&rest[..end.min(40)]).ok()
+}
+
+fn ws_dispatch(msg: Vec<u8>) {
+    WS_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+    WS_RX_LAST.store(health::uptime_s(), Ordering::Relaxed);
     // Keys are sorted alphabetically, so "code" comes after "areas" etc. — look
     // at the whole message, not just its start.
-    if msg.contains("\"code\":556") {
-        *WS_EEW_PENDING.lock().unwrap() = Some(msg.to_string());
-    } else if msg.contains("\"code\":551") {
-        *WS_QUAKE_PENDING.lock().unwrap() = Some(msg.to_string());
+    let code: u16 = json_peek(&msg, b"\"code\":").and_then(|c| c.trim().parse().ok()).unwrap_or(0);
+    // Earthquake-related reports are logged on arrival (also the ones that are
+    // then not shown), so a missing one can be told apart from a missed one.
+    if matches!(code, 551 | 552 | 556) {
+        info!("[WS] rx code {} type {} {} B", code,
+              json_peek(&msg, b"\"type\":").unwrap_or("-"), msg.len());
+    }
+    if code != 551 && code != 556 { return; }
+    let msg = match String::from_utf8(msg) {
+        Ok(m) => m,
+        Err(_) => { warn!("[WS] code {} message is not valid UTF-8, dropped", code); return; }
+    };
+    let mut q = WS_PENDING.lock().unwrap();
+    if q.len() >= WS_PENDING_MAX {
+        q.pop_front();
+        warn!("[WS] pending queue full, oldest message dropped");
+    }
+    q.push_back((code, msg));
+}
+
+/// Raw WEBSOCKET_EVENT_DATA handler, registered next to esp-idf-svc's own.
+///
+/// esp-idf-svc turns each received chunk into `&str` on its own, and a message
+/// larger than what one read returns arrives as several chunks — when a chunk
+/// boundary falls inside a multi-byte (Japanese) character that conversion
+/// fails and the chunk was silently lost. So reassemble the raw bytes here,
+/// using the frame's payload offset/length, and decode only the whole message.
+unsafe extern "C" fn ws_raw_data(_arg: *mut core::ffi::c_void, _base: esp_idf_sys::esp_event_base_t,
+                                 id: i32, data: *mut core::ffi::c_void) {
+    if data.is_null() { return; }
+    let d = &*(data as *const esp_idf_sys::esp_websocket_event_data_t);
+    if id == esp_idf_sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_ERROR {
+        // esp-idf-svc hands errors to the Rust callback as a bare ESP_FAIL, so
+        // a failing (re)connect only ever showed up as "[WS] disconnected".
+        let e = &d.error_handle;
+        // The fields are only filled in for some error types (0 = none: garbage).
+        match e.error_type {
+            esp_idf_sys::esp_websocket_error_type_t_WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT =>
+                warn!("[WS] error: transport, tls_err=0x{:x} tls_stack=-0x{:x} sock_errno={}",
+                      e.esp_tls_last_esp_err, -e.esp_tls_stack_err, e.esp_transport_sock_errno),
+            esp_idf_sys::esp_websocket_error_type_t_WEBSOCKET_ERROR_TYPE_HANDSHAKE =>
+                warn!("[WS] error: handshake, HTTP {}", e.esp_ws_handshake_status_code),
+            2 => warn!("[WS] error: pong timeout"),
+            4 => warn!("[WS] error: closed by the server"),
+            t => warn!("[WS] error (type {})", t),
+        }
+        return;
+    }
+    if id != esp_idf_sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA { return; }
+    // 1 = text, 0 = continuation of a fragmented message; skip control frames.
+    if d.op_code != 1 && d.op_code != 0 { return; }
+    let len = d.data_len.max(0) as usize;
+    let chunk: &[u8] = if len == 0 || d.data_ptr.is_null() { &[] }
+                       else { core::slice::from_raw_parts(d.data_ptr as *const u8, len) };
+
+    let mut rx = WS_RX.lock().unwrap();
+    if d.op_code == 1 && d.payload_offset == 0 {
+        // First chunk of a new message. >4 KB reservations land in PSRAM.
+        rx.clear();
+        WS_RX_SKIP.store(false, Ordering::Relaxed);
+        let total = d.payload_len.max(0) as usize;
+        if total > WS_MSG_MAX {
+            WS_RX_SKIP.store(true, Ordering::Relaxed);
+            warn!("[WS] message of {} B exceeds {} B, dropped", total, WS_MSG_MAX);
+        } else {
+            rx.reserve(total);
+        }
+    }
+    if !WS_RX_SKIP.load(Ordering::Relaxed) {
+        if rx.len() + chunk.len() > WS_MSG_MAX {
+            WS_RX_SKIP.store(true, Ordering::Relaxed);
+            *rx = Vec::new();
+            warn!("[WS] fragmented message exceeds {} B, dropped", WS_MSG_MAX);
+        } else {
+            rx.extend_from_slice(chunk);
+        }
+    }
+    let frame_done = d.payload_offset.max(0) as usize + len >= d.payload_len.max(0) as usize;
+    if frame_done && d.fin {
+        let msg = core::mem::take(&mut *rx); // also frees the (PSRAM) buffer
+        drop(rx);
+        if !WS_RX_SKIP.swap(false, Ordering::Relaxed) && !msg.is_empty() {
+            ws_dispatch(msg);
+        }
     }
 }
 
@@ -555,7 +777,7 @@ fn drop_ws(ws: EspWebSocketClient<'static>) {
         let _ = esp_idf_sys::esp_websocket_client_destroy(h);
     }
     std::mem::forget(ws);
-    WS_PARTIAL.lock().unwrap().clear();
+    *WS_RX.lock().unwrap() = Vec::new();
     WS_CONNECTED.store(false, Ordering::Relaxed);
 }
 
@@ -570,8 +792,7 @@ fn new_ws() -> Option<EspWebSocketClient<'static>> {
         network_timeout_ms: Duration::from_secs(10),
         ..Default::default()
     };
-    // A message larger than the buffer arrives as several Text events: the
-    // first starts with '{', the rest don't. Stitch them back together.
+    // Message data is taken by `ws_raw_data`; this only tracks the connection.
     let cb = move |ev: &Result<esp_idf_svc::ws::client::WebSocketEvent<'_>, esp_idf_svc::io::EspIOError>| {
         let Ok(ev) = ev else { return };
         match &ev.event_type {
@@ -581,30 +802,35 @@ fn new_ws() -> Option<EspWebSocketClient<'static>> {
             }
             WebSocketEventType::Disconnected | WebSocketEventType::Closed | WebSocketEventType::Close(_) => {
                 WS_CONNECTED.store(false, Ordering::Relaxed);
-                WS_PARTIAL.lock().unwrap().clear();
+                *WS_RX.lock().unwrap() = Vec::new();
                 info!("[WS] disconnected");
-            }
-            WebSocketEventType::Text(t) => {
-                let mut partial = WS_PARTIAL.lock().unwrap();
-                if t.starts_with('{') {
-                    partial.clear();
-                }
-                if t.starts_with('{') || !partial.is_empty() {
-                    if partial.len() + t.len() > WS_MSG_MAX { partial.clear(); return; }
-                    partial.push_str(t);
-                    if partial.trim_end().ends_with('}') {
-                        ws_dispatch(&partial);
-                        partial.clear();
-                        partial.shrink_to(0);
-                    }
-                }
             }
             _ => {}
         }
     };
-    EspWebSocketClient::new(URL_WS, &cfg, Duration::from_secs(10), cb)
+    let ws = EspWebSocketClient::new(URL_WS, &cfg, Duration::from_secs(10), cb)
         .map_err(|e| warn!("[WS] create failed: {:?}", e))
-        .ok()
+        .ok()?;
+    {
+        use esp_idf_svc::handle::RawHandle;
+        let r = unsafe {
+            let h = ws.handle();
+            // Errors are diagnostics only: a failure to register them is not fatal.
+            let _ = esp_idf_sys::esp_websocket_register_events(
+                h, esp_idf_sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_ERROR,
+                Some(ws_raw_data), core::ptr::null_mut());
+            esp_idf_sys::esp_websocket_register_events(
+                h, esp_idf_sys::esp_websocket_event_id_t_WEBSOCKET_EVENT_DATA,
+                Some(ws_raw_data), core::ptr::null_mut())
+        };
+        if r != esp_idf_sys::ESP_OK {
+            // Without it no message would ever be seen: let REST take over.
+            warn!("[WS] registering the data handler failed ({}), not using the WebSocket", r);
+            drop_ws(ws);
+            return None;
+        }
+    }
+    Some(ws)
 }
 
 /// Spawn the polling thread. It waits for WiFi and a synced clock (TLS cert
@@ -628,9 +854,13 @@ pub fn start() {
             let mut booted_eew = false;
             let mut last_eew_id = String::new();
             let mut last_low_warn = 0u64;
+            let mut ws_missing_since: Option<u64> = None; // since when no connected WebSocket
+            let hb = &health::QUAKE;
             loop {
+                hb.mark(health::q::LOOP);
                 // Map fetch worker asked for the memory: drop the WebSocket.
                 if WS_RELEASE.swap(false, Ordering::Relaxed) && ws.is_some() {
+                    hb.mark(health::q::WS_DROP);
                     if let Some(w) = ws.take() { drop_ws(w); }
                     WS_CONNECTED.store(false, Ordering::Relaxed);
                     WS_ALIVE.store(false, Ordering::Relaxed);
@@ -648,22 +878,33 @@ pub fn start() {
                 if EEW.lock().unwrap().as_ref().map(|e| now >= e.expires).unwrap_or(false) {
                     clear_eew();
                 }
+                // Expire a 震度速報 banner no epicenter report followed.
+                if PROMPT.lock().unwrap().as_ref().map(|p| now >= p.expires).unwrap_or(false) {
+                    clear_prompt("expired");
+                }
                 // Expire the "new earthquake" map view and give the map back.
                 if NEWQ.lock().unwrap().as_ref().map(|n| now >= n.expires).unwrap_or(false) {
                     clear_new_quake();
                     if EEW.lock().unwrap().is_none() { clear_focus(); }
                 }
 
-                // Earthquake info pushed over the WebSocket.
-                if let Some(msg) = WS_QUAKE_PENDING.lock().unwrap().take() {
-                    merge_pushed(msg.as_bytes());
+                // Earthquake info / EEW pushed over the WebSocket, in arrival order.
+                loop {
+                    let Some((code, msg)) = WS_PENDING.lock().unwrap().pop_front() else { break };
+                    if code == 556 {
+                        hb.mark(health::q::WS_EEW);
+                        handle_eew(msg.as_bytes(), &mut last_eew_id);
+                    } else if msg.contains("\"type\":\"ScalePrompt\"") {
+                        hb.mark(health::q::WS_PUSHED);
+                        handle_prompt(msg.as_bytes());
+                    } else {
+                        hb.mark(health::q::WS_PUSHED);
+                        merge_pushed(msg.as_bytes());
+                    }
                 }
 
-                // EEW pushed over the WebSocket.
-                if let Some(msg) = WS_EEW_PENDING.lock().unwrap().take() {
-                    handle_eew(msg.as_bytes(), &mut last_eew_id);
-                }
-
+                // Time without WiFi/clock does not count towards the WebSocket restart.
+                if !ready { ws_missing_since = None; }
                 if ready {
                     // (Re)create the WebSocket client; it reconnects by itself,
                     // so only replace it when it has been stuck for a while.
@@ -680,6 +921,7 @@ pub fn start() {
                     if ws.is_some() && ws_down_since.map(|t| now.saturating_sub(t) > 180).unwrap_or(false) {
                         ws_down_since = None;
                         warn!("[WS] not connected for 180 s, recreating");
+                        hb.mark(health::q::WS_DROP);
                         if let Some(w) = ws.take() { drop_ws(w); }
                         WS_ALIVE.store(false, Ordering::Relaxed);
                     }
@@ -688,8 +930,18 @@ pub fn start() {
                         && !crate::audio::playing()
                         && (now as u32).saturating_sub(LAST_MAP_FETCH_SECS.load(Ordering::Relaxed)) >= WS_RESUME_AFTER_MAP_SECS {
                         ws_since = now;
+                        // The REST client kept alive between the fallback polls holds a
+                        // TLS session in internal RAM. Release it first, or it can keep
+                        // the heap just under the threshold for good: the WebSocket then
+                        // never starts, so REST keeps polling and keeps the session open
+                        // (seen 2026-11-07 23:27 UTC until noticed hours later).
+                        if internal_free() < WS_MIN_INTERNAL_FREE && client.is_some() {
+                            client = None;
+                            info!("[WS] released the REST client for the WebSocket, internal heap {} B", internal_free());
+                        }
                         if internal_free() >= WS_MIN_INTERNAL_FREE {
                             let before = internal_free();
+                            hb.mark(health::q::WS_CREATE);
                             ws = new_ws();
                             WS_ALIVE.store(ws.is_some(), Ordering::Relaxed);
                             // Catch up on any EEW issued while the socket was down.
@@ -699,6 +951,15 @@ pub fn start() {
                         } else {
                             warn!("[WS] internal heap low ({} B), not starting", internal_free());
                         }
+                    }
+                    // Last resort: no WebSocket for this long means pushes (and
+                    // fast EEW) are lost; a clean boot gets the heap back.
+                    if ws.is_some() && ws_up {
+                        ws_missing_since = None;
+                    } else if now.saturating_sub(*ws_missing_since.get_or_insert(now)) > WS_MISSING_RESTART_SECS
+                        && !crate::audio::playing() && EEW.lock().unwrap().is_none() {
+                        health::restart(&format!("WebSocket down for {} s (internal heap {} B)",
+                                                 WS_MISSING_RESTART_SECS, internal_free()));
                     }
 
                     if internal_free() < MIN_INTERNAL_FREE {
@@ -716,6 +977,7 @@ pub fn start() {
                         if now >= next_eew && (!booted_eew || !ws_up) && !crate::map_display::is_busy() && map_quiet {
                             booted_eew = true;
                             next_eew = now + EEW_POLL_SECS;
+                            hb.mark(health::q::REST_EEW);
                             if let Some(body) = http_get(&mut client, URL_EEW) {
                                 handle_eew(&body, &mut last_eew_id);
                                 info!("[EEW] REST check done, stack high-water {} B free", stack_free());
@@ -728,6 +990,7 @@ pub fn start() {
                         if now >= next_quake && !crate::map_display::is_busy() {
                             next_quake = now + if ws_up { QUAKE_RESYNC_SECS } else { POLL_SECS };
                             let before = internal_free();
+                            hb.mark(health::q::REST_QUAKE);
                             match http_get(&mut client, URL_QUAKE).and_then(|b| parse(&b)) {
                                 Some(list) => {
                                     let mut cur = QUAKES.lock().unwrap();
@@ -750,6 +1013,7 @@ pub fn start() {
                         if ws_up { client = None; }
                     }
                 }
+                hb.mark(health::q::SLEEP);
                 thread::sleep(Duration::from_millis(if ready { 100 } else { 5000 }));
             }
         });

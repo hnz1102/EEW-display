@@ -21,12 +21,14 @@ Written in Rust (esp-idf-hal / esp-idf-svc).  The KiCad design of the board is i
 | Earthquake list | The 20 most recent events (8 rows visible, the list scrolls with the highlight): time (JST), magnitude, maximum intensity, depth, epicenter coordinates and tsunami flag |
 | Map | Google Maps Static API tile (satellite or roadmap) filling the screen, with the recent epicenters drawn on it, sized by magnitude and coloured by intensity; Japan overview by default, or centred on the quake picked in the list.  The nearest well-known place, with distance and direction, is shown for the selected / new / EEW epicenter |
 | EEW alert | On a warning the TFT switches to the map by itself, marks the forecast epicenter with a red `X` and shows magnitude, maximum forecast intensity and depth; the Web UI shows a red banner |
-| Voice | Chime + Japanese spoken announcement of every EEW and every newly received earthquake through the on-board MAX98357A amplifier and speaker; each can be switched off, and the volume set, in the Web UI (see [Spoken announcements](#spoken-announcements-japanese)) |
+| 震度速報 | The JMA seismic-intensity flash (issued about 1.5 minutes after a quake of intensity 3 or more, before the epicenter is known) is announced and shown at once — maximum intensity and the areas that observed it — and replaced by the full report when that arrives |
+| Voice | Chime + Japanese spoken announcement of every EEW, 震度速報 and newly received earthquake through the on-board MAX98357A amplifier and speaker; each can be switched off, and the volume set, in the Web UI (see [Spoken announcements](#spoken-announcements-japanese)) |
 | Screen saver / idle clock | After a configurable idle time the backlight goes off, or a full-screen analog clock (JST) is shown; a button press or an EEW / new earthquake returns to the pages (see [Screen saver and idle clock](#screen-saver-and-idle-clock)) |
 | Time sync | NTP (up to 4 servers) |
 | Web UI | Browser-based configuration, earthquake list, map, audio controls |
 | WPS | Wi-Fi Protected Setup (PBC mode), started at boot when no SSID is set |
 | Syslog | Optional UDP syslog (RFC 5424) |
+| Self-monitoring | Thread heartbeats and a software watchdog that restarts the unit when the feed or audio thread stalls or the WebSocket stays down; a `[DIAG]` status line every 10 minutes (see [Health monitoring](#health-monitoring)) |
 
 ---
 
@@ -212,6 +214,7 @@ and a synced clock (NTP), because the connection is TLS.
 | **EARTHQUAKE** page (TFT) | The 20 most recent events (8 rows visible, the list scrolls with the highlight): time (JST), magnitude, maximum intensity (`I5-` = 5弱, `I5+` = 5強, …), depth and epicenter coordinates; tsunami warnings are flagged.  **+ / −** move the highlight, the **action** button (GPIO40) shows the highlighted epicenter on the MAP page |
 | **MAP** page | Epicenters of recent earthquakes inside the visible map are drawn as circles — sized by magnitude, coloured by maximum intensity — with a label such as `M5.2 I5-` |
 | **Web UI** (configuration page) | A *Recent Earthquakes* card with the epicenter name (Japanese), magnitude, intensity, depth and tsunami status.  The epicenter name opens the Web UI map (`/map?lat=…&lon=…&zoom=…`) centred on it |
+| **震度速報** | An orange band on the MAP page (`SHINDO REPORT Imax 3`, `Epicenter: pending`, number of areas at the maximum intensity, quake time), the title `SHINDO 3 (no epicenter yet)`, a status line on the EARTHQUAKE page, and an orange banner in the Web UI with the area names in Japanese.  It disappears when the epicenter report for the same quake arrives, or after 15 minutes |
 | **EEW alert** | On a warning the TFT switches to the MAP page by itself and centres the forecast epicenter: a large red `X`, the header turns red (`!! EEW M6.3 I5- !!`) and a box at the bottom right of the map shows magnitude, maximum forecast intensity, depth, coordinates and issue time.  The Web UI shows a red banner with the forecast areas |
 
 The TFT font is ASCII only, so Japanese epicenter and area names appear in the
@@ -225,7 +228,17 @@ How it works (`src/quake.rs`):
 
 - A WebSocket (`wss://api.p2pquake.net/v2/ws`) receives the events as they are
   registered.  Warnings (code 556) raise the alert, earthquake reports (551) are
-  merged into the list.  Test messages and warnings older than 3 minutes (by
+  merged into the list.  A 551 report comes in up to three steps: 震度速報
+  (`ScalePrompt`, intensities only, ~1.5 min after the quake), 震源情報
+  (`Destination`, epicenter and magnitude) and 各地の震度 (`DetailScale`).  The
+  first is announced as a 震度速報 (ignored if older than 20 minutes or the quake
+  is already in the list); the later ones complete the list entry and trigger
+  the new-earthquake announcement.  Note that P2P地震情報 relays EEWs (556) only
+  at warning level (警報), not forecasts (予報).
+- Messages are reassembled from the WebSocket frames by offset (up to 256 KB —
+  a `DetailScale` report can be ~80 KB), so a chunk boundary inside a UTF-8
+  character does not lose the message.  Every 551 / 552 / 556 message is logged
+  on arrival as `[WS] rx code 551 type Destination 591 B`.  Test messages and warnings older than 3 minutes (by
   their issue time) are ignored, so a boot in the middle of an old event does
   not alert.
 - REST (`/v2/history`) loads the initial list (the 20 latest events) at boot,
@@ -233,7 +246,10 @@ How it works (`src/quake.rs`):
   60 s (list) — while the WebSocket is down.
 - The WebSocket pings every 30 s and reconnects by itself 30 s after a drop
   (the server also closes long-lived connections now and then, e.g. after about
-  an hour); it is only recreated after it has stayed down for 180 s.
+  an hour); it is only recreated after it has stayed down for 180 s.  If it
+  cannot be opened because internal RAM is short, the REST client is released
+  first; if it stays down for 30 minutes the unit restarts (see
+  [Health monitoring](#health-monitoring)).
 - Network use waits for an IP address: the map and the feed start as soon as
   Wi-Fi reports one (tracked from system events, not by polling the driver).
 - **Memory:** the TLS WebSocket holds roughly 30 KB of internal RAM, which
@@ -264,6 +280,30 @@ alert path fires right after boot.  Never ship a sandbox build.
 > [terms for secondary use](https://www.p2pquake.net/secondary_use/): credit the
 > Japan Meteorological Agency and P2P地震情報 (the Web UI card already does).
 
+### Health monitoring
+
+[`src/health.rs`](src/health.rs) watches the threads that the screen does not
+show.  The earthquake-feed thread and the audio thread record a heartbeat with
+their current stage every time round their loops; the main loop checks them.
+
+| Condition | Action |
+|-----------|--------|
+| Feed thread has not moved for 180 s | Log `[WDOG] quake thread stuck … at <stage>` and restart |
+| Audio thread has not moved for 60 s | Log `[WDOG] audio thread stuck … at <stage>` and restart |
+| WebSocket not connected for 30 minutes (not while speaking or during an EEW) | Log `[WDOG] …` and restart |
+
+The reason is kept in RTC memory, which survives the restart, and logged again
+after the next boot as `[WDOG] previous run was restarted by the watchdog: …`, in
+case the line before the restart did not reach syslog.  Every 10 minutes a line
+like
+
+```
+[DIAG] quake: 3 s ago at sleep | audio: 0 s ago at recv playing=false | ws=true rx 42 msgs, last 312 s ago map_busy=false | internal 61234 B (min 40120) psram 7012 KB
+```
+
+shows each thread's stage, the WebSocket state and how many messages it has
+received, and the internal RAM / PSRAM headroom.
+
 ---
 
 ## Spoken announcements (Japanese)
@@ -281,6 +321,13 @@ speaker:
   "ピンポン" chime, then the sentence once:
   「地震情報。震源は茨城県南部です。マグニチュード4点6。最大震度4。深さ50キロ。この地震による津波の心配はありません。」
   Dropped if an EEW is being spoken, and during the [quiet hours](#quiet-hours-new-earthquake-announcements) if set (EEWs ignore those).
+- **震度速報** (intensity flash, before the epicenter is known): the "ピンポン"
+  chime, then
+  「震度速報。最大震度3。最大震度を観測した地域は、福島県中通り、福島県浜通り、茨城県北部、栃木県南部などです。」
+  Up to four areas that observed the maximum intensity are named (「など」 when
+  there are more); an area whose name cannot be spoken in full is left out
+  rather than cut short.  Spoken again only if a later flash raises the maximum
+  intensity.  Follows the new-earthquake switch and the quiet hours.
 
 The chimes are generated by the firmware — sustained / bell-like notes with a
 reverb that is applied to the chime only, not to the speech — so they also sound
@@ -289,13 +336,18 @@ without a voice bank.  The audio thread runs at a raised priority on core 1 with
 cannot make the sound break up.
 The speech is **not synthesized on the device and needs no network or API key at
 run time**.  It is generated once on a PC with Google Cloud Text-to-Speech as
-~340 short parts (fixed phrases, numbers 0–99 and 100–700, the nine seismic
+~360 short parts (fixed phrases, numbers 0–99 and 100–700, the nine seismic
 intensities, and parts of region names such as 福島県 + 沖) and flashed to a
 dedicated `voice` partition; the firmware strings the parts together.  A
 hypocenter name is spoken as far as its parts match (so 福島県沖 = 福島県 + 沖); a
 name with an unknown part is cut short instead of being misread.  To cover more
 names, add parts to [`tools/voice/tokens.txt`](tools/voice/tokens.txt) and
-regenerate.
+regenerate.  All 181 JMA intensity-report area names seen in the P2P history
+(e.g. 福島県中通り, 東京都２３区, 熊本県熊本) can be spoken in full.
+
+> v0.4.0 added parts for the 震度速報 sentence.  After updating from an older
+> version, regenerate and re-flash `voice.bin` as well (`./flash.sh` or
+> `./flash.sh --voice-only`), or the announcement is incomplete.
 
 ### 1. Generate `voice.bin` (once, on a PC)
 
@@ -341,7 +393,7 @@ announcements are off).
 ### 3. Test
 
 The Web UI configuration page has an **Audio** card (shown when `audio_enable =
-"true"`): *Test EEW voice* and *Test new-quake voice* play sample announcements
+"true"`): *Test EEW voice*, *Test new-quake voice* and *Test 震度速報 voice* play sample announcements
 (also when the matching switch is off), and the sine test tone (100 Hz – 15 kHz,
 off by default) can be switched on and tuned.  The same card has the **volume**
 slider (applied while you drag, stored in NVS on release) and the **Announce**
@@ -384,6 +436,7 @@ eew-display/
 │   ├── quake.rs          # Earthquake list + EEW (P2P地震情報 WebSocket / REST)
 │   ├── httpserver.rs     # HTTP server, NVS config management
 │   ├── wifi.rs           # Wi-Fi STA connection (DHCP / static IP), WPS, reconnect, event-driven network state
+│   ├── health.rs         # Thread heartbeats, watchdog restart, [DIAG] status line
 │   ├── syslogger.rs      # UDP Syslog logger (RFC 5424)
 │   ├── btn_ctrl.rs       # Button handling
 │   └── boot_log.rs       # NVS boot counter and rolling reset-reason log (last 10 entries)
@@ -785,8 +838,8 @@ the `cfg.toml` values, and *Boot Log* shows the reset reasons of the last boots.
 | Card | What it does |
 |------|--------------|
 | **Device Status** | Firmware version and build date, IP address, SSID, signal strength, battery voltage, chip temperature, free internal RAM and PSRAM (refreshed every 3 s) |
-| **Recent Earthquakes** | The latest events with the epicenter name in Japanese (a link to the Web UI map centred on it), magnitude, intensity, depth and tsunami status; a red banner while an EEW is active |
-| **Audio** | Test tone on/off with a 100 Hz – 15 kHz slider, **Volume** slider, **Announce** switches for EEW / new earthquake, **Quiet hours** (a daily window with no new-earthquake announcements; EEW always sounds), and *Test EEW voice* / *Test new-quake voice* buttons (shown when `audio_enable = "true"`) |
+| **Recent Earthquakes** | The latest events with the epicenter name in Japanese (a link to the Web UI map centred on it), magnitude, intensity, depth and tsunami status; a red banner while an EEW is active, an orange one for a 震度速報 |
+| **Audio** | Test tone on/off with a 100 Hz – 15 kHz slider, **Volume** slider, **Announce** switches for EEW / new earthquake, **Quiet hours** (a daily window with no new-earthquake announcements; EEW always sounds), and *Test EEW voice* / *Test new-quake voice* / *Test 震度速報 voice* buttons (shown when `audio_enable = "true"`) |
 | **WiFi / Network** | SSID and password, WPS enable, DHCP or static IP |
 | **Syslog** | Optional remote logging (server, host name, app name) |
 | **Authentication** | The Web UI user name and password |
@@ -847,7 +900,7 @@ required: `web_user` / `web_password`).
 | `/` | GET | Configuration page, device status and recent earthquakes (auth required) |
 | `/map` | GET | Map page with the recent epicenters; `?lat=&lon=&zoom=` views an arbitrary point (e.g. an epicenter) |
 | `/api/mapinfo` | GET | Map centre and zoom the TFT is showing (JSON) |
-| `/api/quakes` | GET | Recent earthquakes and the active EEW, if any (JSON; `enabled:false` when `quake_enable` is off) |
+| `/api/quakes` | GET | Recent earthquakes, the active EEW and the pending 震度速報 (`prompt`: time, intensity, areas, n_areas), if any (JSON; `enabled:false` when `quake_enable` is off) |
 | `/api/map/pixels` | GET | Current map image (raw RGB565) |
 | `/api/mapkey` | GET | Maps API key and map type, for the browser-side map |
 | `/api/map/zoomin`, `/api/map/zoomout` | POST | Change map zoom |
@@ -857,7 +910,7 @@ required: `web_user` / `web_password`).
 | `/api/reset` | POST | Erase NVS and restore cfg.toml defaults |
 | `/api/reboot` | POST | Reboot the device |
 | `/api/boot_log` | GET | Boot history with reset reasons from NVS (JSON) |
-| `/api/tone` | GET / POST | Audio state (running, tone Hz / on, voice bank present, volume, announcement switches).  POST any of: `hz=100..15000`, `on=true|false` (test tone); `speak=eew|new` (play a sample announcement); `volume=0..100` (`&save=1` also stores it in NVS); `notify_eew=true|false`, `notify_new=true|false`, `quiet_enable=true|false`, `quiet_start=HH:MM`, `quiet_end=HH:MM` (stored in NVS).  Only with `audio_enable = "true"` |
+| `/api/tone` | GET / POST | Audio state (running, tone Hz / on, voice bank present, volume, announcement switches).  POST any of: `hz=100..15000`, `on=true|false` (test tone); `speak=eew|new|prompt` (play a sample announcement); `volume=0..100` (`&save=1` also stores it in NVS); `notify_eew=true|false`, `notify_new=true|false`, `quiet_enable=true|false`, `quiet_start=HH:MM`, `quiet_end=HH:MM` (stored in NVS).  Only with `audio_enable = "true"` |
 
 ---
 
